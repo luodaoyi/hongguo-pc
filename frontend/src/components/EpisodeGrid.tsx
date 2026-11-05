@@ -94,10 +94,23 @@ export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: P
                 onPick(episode);
               }}
             >
-              <span className="episode-cell__number">第 {episode.number} 集</span>
-              <span className="episode-cell__meta">
-                {episode.isNew ? <em className="episode-cell__new">新</em> : null}
-                {formatDuration(episode.durationSec)}
+              {episode.coverUrl ? (
+                <img
+                  className="episode-cell__thumb"
+                  src={episode.coverUrl}
+                  alt=""
+                  loading="lazy"
+                  onError={(event) => {
+                    event.currentTarget.style.display = 'none';
+                  }}
+                />
+              ) : null}
+              <span className="episode-cell__text">
+                <span className="episode-cell__number">第 {episode.number} 集</span>
+                <span className="episode-cell__meta">
+                  {episode.isNew ? <em className="episode-cell__new">新</em> : null}
+                  {formatDuration(episode.durationSec)}
+                </span>
               </span>
             </button>
           );

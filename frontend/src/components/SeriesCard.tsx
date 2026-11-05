@@ -28,6 +28,11 @@ export function SeriesCard({ series, onClick }: Props) {
       <div className="series-card__title" title={series.title}>
         {series.title}
       </div>
+      {series.description ? (
+        <div className="series-card__desc" title={series.description}>
+          {series.description}
+        </div>
+      ) : null}
       <div className="series-card__meta">{statusText(series.status)}</div>
     </button>
   );

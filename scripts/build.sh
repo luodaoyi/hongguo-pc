@@ -66,13 +66,41 @@ fi
 
 # ---------------------------------------------------------------- 2. 绑定
 # 优先让 wails3 负责；失败不静默：前端若真依赖 bindings，会在 tsc/vite 阶段报错。
+# 参数必须是 `-ts -d frontend/bindings ./cmd/app`：缺 `-ts` 会生成 .js 并把入库的
+# .ts 绑定清掉（-clean 默认开），缺 `./cmd/app` 只扫仓库根、一个绑定都出不来。
 if command -v wails3 >/dev/null 2>&1; then
-  note "bindings: wails3 generate bindings"
-  if ! wails3 generate bindings; then
+  note "bindings: wails3 generate bindings -ts ./cmd/app"
+  if ! wails3 generate bindings -ts -d frontend/bindings ./cmd/app; then
     echo "warning: wails3 generate bindings 失败，继续（前端构建会暴露缺绑定问题）" >&2
   fi
 else
   note "bindings: 跳过（本机无 wails3）"
+fi
+
+# ---------------------------------------------------------------- 2.5 Windows 资源（图标 / manifest / 版本信息）
+# wails3 generate syso 产出 cmd/app/wails_windows_<arch>.syso，Go 链接器按文件名
+# 后缀自动带入 main 包（只在 windows/<arch> 生效，不影响其它平台）。
+# 产物 gitignore 但保留在源树里：裸 `go build ./cmd/app` 也能带图标。
+# 无 wails3 时降级继续：可运行、无图标——与 v0.1.0 的次因一致， warning 提示。
+if [ "$GOOS" = "windows" ]; then
+  case "$GOARCH" in
+    amd64|arm64|386) ;;
+    *) die "windows/$GOARCH 无法生成 syso（wails3 仅支持 amd64/arm64/386）" ;;
+  esac
+  if command -v wails3 >/dev/null 2>&1; then
+    [ -f build/windows/icon.ico ]          || die "build/windows/icon.ico 缺失（由 scripts/make-icon.ps1 生成并入库）"
+    [ -f build/windows/wails.exe.manifest ] || die "build/windows/wails.exe.manifest 缺失"
+    [ -f build/windows/info.json ]          || die "build/windows/info.json 缺失"
+    note "syso: wails3 generate syso -arch $GOARCH"
+    wails3 generate syso -arch "$GOARCH" \
+      -icon build/windows/icon.ico \
+      -manifest build/windows/wails.exe.manifest \
+      -info build/windows/info.json \
+      -out "$ENTRY/wails_windows_$GOARCH.syso"
+    [ -f "$ENTRY/wails_windows_$GOARCH.syso" ] || die "syso 未生成（wails3 generate syso 失败但无输出，检查 wails3 版本）"
+  else
+    echo "warning: 本机无 wails3，跳过 syso：产物可运行但没有图标/版本信息（go install github.com/wailsapp/wails/v3/cmd/wails3@v3.1.0）" >&2
+  fi
 fi
 
 # ---------------------------------------------------------------- 3. go build

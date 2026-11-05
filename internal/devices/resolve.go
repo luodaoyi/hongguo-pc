@@ -106,20 +106,28 @@ func (p *Pool) ResolvePlayback(ctx context.Context, episodeID string) (*sdkmodel
 	return nil, ErrQuotaExhausted
 }
 
-// Do 在池内取一个槽执行一次目录类调用（0 额度，方案 §4.5）。
-//
-// 名称只用于日志；回调里的客户端仅在回调期间有效，且只允许调目录接口，
-// 播放解析必须走 ResolvePlayback。
-//
-// 回调返回 ErrDeviceRejected 时：除 sdkx 钩子记下的拒绝次数外，这里再记一次
-// 「非播放换档」计数（方案 §4.4 的 M1 补充：非播放入口同样会烧设备），并且立刻
-// 对该槽执行 ResetDevice 换档案，成功后把它恢复为 healthy（T13 审查 D3）。
-// 换档失败只让槽进冷却，本次调用仍返回原来的 ErrDeviceRejected。
+// Do 在池内取一个槽执行一次目录类调用（0 额度，方案 §4.5）。只用 healthy 槽。
 func (p *Pool) Do(ctx context.Context, name string, fn func(ctx context.Context, c *sdkx.Client) error) error {
+	return p.do(ctx, name, fn, p.Acquire)
+}
+
+// DoReadOnly 与 Do 相同，但允许使用非 healthy 的槽（优先级 healthy > cooling >
+// exhausted > rejected）：0 额度调用不消耗播放额度，播放额度耗尽后浏览与选集
+// 仍应可用——否则「额度耗尽只影响播放」的界面承诺就是空话。
+func (p *Pool) DoReadOnly(ctx context.Context, name string, fn func(ctx context.Context, c *sdkx.Client) error) error {
+	return p.do(ctx, name, fn, p.AcquireAny)
+}
+
+// do 是目录调用的公共实现：acquire 决定选槽策略；回调返回 ErrDeviceRejected 时
+// 除 sdkx 钩子记下的拒绝次数外，这里再记一次「非播放换档」计数（方案 §4.4 的
+// M1 补充：非播放入口同样会烧设备），并立刻对该槽执行 ResetDevice 换档案，
+// 成功后恢复为 healthy（T13 审查 D3）。换档失败只让槽进冷却，本次调用仍返回
+// 原来的 ErrDeviceRejected。
+func (p *Pool) do(ctx context.Context, name string, fn func(ctx context.Context, c *sdkx.Client) error, acquire func(ctx context.Context) (*Slot, error)) error {
 	if fn == nil {
 		return fmt.Errorf("devices: nil catalog callback")
 	}
-	s, err := p.Acquire(ctx)
+	s, err := acquire(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err

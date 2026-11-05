@@ -8,9 +8,13 @@
 
 # 构建产物
 /bin/
-/build/
 /dist/
 *.exe
+# Windows 资源（图标/manifest/版本信息）由 wails3 generate syso 生成到 cmd/app/，
+# 带架构后缀、构建脚本每次覆盖；gitignore 但不删除，让裸 go build 也能带上图标。
+*.syso
+# 注意：build/ 不再整体忽略——build/appicon.png 与 build/windows/{icon.ico,
+# wails.exe.manifest,info.json} 是入库的源资产（由 scripts/make-icon.ps1 生成 ICO）。
 
 # Wails v3 生成物（T10 起）
 # frontend/bindings/ 由 `wails3 generate bindings -ts -d frontend/bindings ./cmd/app` 生成，

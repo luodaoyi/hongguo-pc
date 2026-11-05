@@ -11,11 +11,15 @@ export function DiscoverPage() {
   const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [columns, setColumns] = useState(4);
+  const gridRef = useRef<HTMLDivElement | null>(null);
 
   const cursorRef = useRef('');
   const hasMoreRef = useRef(true);
   const loadingRef = useRef(false);
   const seenRef = useRef<Set<string>>(new Set());
+  // 上游推荐流耗尽后的回卷计数：连续两页拉不到新内容才真正停（防对静态流空转刷请求）。
+  const emptyWrapsRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
 
   const loadMore = useCallback(async () => {
@@ -27,8 +31,16 @@ export function DiscoverPage() {
       const fresh = (page.items ?? []).filter((series) => !seenRef.current.has(series.id));
       for (const series of fresh) seenRef.current.add(series.id);
       setItems((prev) => [...prev, ...fresh]);
-      cursorRef.current = page.cursor ?? '';
-      hasMoreRef.current = Boolean(page.hasMore) && fresh.length > 0;
+      if (page.hasMore) {
+        cursorRef.current = page.cursor ?? '';
+        hasMoreRef.current = true;
+        emptyWrapsRef.current = 0;
+      } else {
+        // 上游游标耗尽：回到第一页续拉（推荐流轮换会出现新内容），瀑布流无限续。
+        cursorRef.current = '';
+        emptyWrapsRef.current = fresh.length > 0 ? 0 : emptyWrapsRef.current + 1;
+        hasMoreRef.current = emptyWrapsRef.current < 2;
+      }
       setError(null);
     } catch (err) {
       hasMoreRef.current = false;
@@ -43,6 +55,20 @@ export function DiscoverPage() {
   useEffect(() => {
     void loadMore();
   }, [loadMore]);
+
+  // 瀑布流列数随容器宽度自适应（220px 一列，2-8 列）。
+  useEffect(() => {
+    const el = gridRef.current;
+    if (!el) return undefined;
+    const update = () => {
+      const k = Math.max(2, Math.min(8, Math.floor(el.clientWidth / 220) || 2));
+      setColumns((prev) => (prev === k ? prev : k));
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const element = sentinelRef.current;
@@ -63,11 +89,30 @@ export function DiscoverPage() {
     void loadMore();
   };
 
+  // 刷新推荐：清空去重表与游标，从第一页重新拉。上游按请求返回推荐流，
+  // 重拉即得到新的一批推进剧集。
+  const refresh = useCallback(async () => {
+    if (loadingRef.current) return;
+    seenRef.current = new Set();
+    cursorRef.current = '';
+    emptyWrapsRef.current = 0;
+    hasMoreRef.current = true;
+    setItems([]);
+    setHasMore(true);
+    setError(null);
+    await loadMore();
+  }, [loadMore]);
+
   return (
     <section className="page">
-      <header className="page__header">
-        <h1>书城</h1>
-        <p className="page__hint">推荐内容来自上游接口，点击卡片可以查看剧集。</p>
+      <header className="page__header page__header--row">
+        <div>
+          <h1>书城</h1>
+          <p className="page__hint">推荐内容来自上游接口，点击卡片可以查看剧集。</p>
+        </div>
+        <button className="button" type="button" onClick={() => void refresh()} disabled={loading}>
+          刷新推荐
+        </button>
       </header>
 
       {error ? (
@@ -79,13 +124,19 @@ export function DiscoverPage() {
         </div>
       ) : null}
 
-      <div className="card-grid">
-        {items.map((series) => (
-          <SeriesCard
-            key={series.id}
-            series={series}
-            onClick={(picked) => navigate(`/series/${picked.id}`)}
-          />
+      <div className="card-grid" ref={gridRef}>
+        {Array.from({ length: columns }, (_, ci) => (
+          <div className="card-col" key={ci}>
+            {items
+              .filter((_, i) => i % columns === ci)
+              .map((series) => (
+                <SeriesCard
+                  key={series.id}
+                  series={series}
+                  onClick={(picked) => navigate(`/series/${picked.id}`)}
+                />
+              ))}
+          </div>
         ))}
       </div>
 

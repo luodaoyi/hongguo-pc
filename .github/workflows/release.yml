@@ -77,6 +77,9 @@ jobs:
           [ -f "frontend/package.json" ] || { echo "::error file=frontend/package.json::前端工程尚未落地，CI 无法构建"; fail=1; }
           [ -f "scripts/build.sh" ]      || { echo "::error file=scripts/build.sh::构建脚本缺失"; fail=1; }
           [ -f "scripts/package.sh" ]    || { echo "::error file=scripts/package.sh::打包脚本缺失"; fail=1; }
+          [ -f "build/windows/icon.ico" ]          || { echo "::error file=build/windows/icon.ico::图标缺失（scripts/make-icon.ps1 生成并入库）"; fail=1; }
+          [ -f "build/windows/wails.exe.manifest" ] || { echo "::error file=build/windows/wails.exe.manifest::manifest 缺失，Windows 产物将无 DPI/UAC 声明"; fail=1; }
+          [ -f "build/windows/info.json" ]          || { echo "::error file=build/windows/info.json::info.json 缺失，Windows 产物将无版本信息"; fail=1; }
           echo "go:     $(go version)"
           echo "node:   $(node --version)"
           echo "target: ${GOOS:-unset}/${GOARCH:-unset}"
@@ -153,6 +156,33 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           APP_NAME: ${{ env.APP_NAME }}
         run: bash scripts/package.sh
+
+      # 冒烟校验（docs/rootcause-exe-not-launch.md §9.2）：解压到干净目录后直接启动，
+      # 防止「包里缺资源/资源按 CWD 解析」这类缺陷再次静默发布。
+      # 只在 windows/amd64 上跑：需要 GUI + WebView2；arm64 runner 的 WebView2 情况未验证。
+      - name: Smoke test (clean dir launch)
+        if: matrix.goos == 'windows' && matrix.goarch == 'amd64'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'smoke-clean'
+          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Expand-Archive -Path 'dist/hongguo-pc_windows_amd64.zip' -DestinationPath $dir -Force
+          $exe = Join-Path $dir 'hongguo-pc.exe'
+          $p = Start-Process -FilePath $exe -WorkingDirectory $dir -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) {
+            $log = Join-Path $env:LOCALAPPDATA 'hongguo-pc\startup-error.log'
+            if (Test-Path $log) {
+              Write-Host '--- startup-error.log ---'
+              Get-Content $log
+            } else {
+              Write-Host 'startup-error.log 不存在（进程在写日志前就退出了？）'
+            }
+            throw "smoke test failed: 进程 8 秒内退出 exit=$($p.ExitCode)"
+          }
+          Write-Host "smoke ok: 进程存活 MainWindowTitle='$($p.MainWindowTitle)'"
+          Stop-Process -Id $p.Id -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

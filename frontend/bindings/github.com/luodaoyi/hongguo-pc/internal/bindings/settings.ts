@@ -27,7 +27,8 @@ export function Get(key: string): $CancellablePromise<string> {
 }
 
 /**
- * Set 写一个设置项。ffmpegPath 立即生效：Media.DetectFFmpeg 每次都读最新值。
+ * Set 写一个设置项。ffmpegPath 立即生效：Media.DetectFFmpeg 每次都读最新值；
+ * deviceSlots 需要重启（设备池在启动时按槽数构建），这里只做范围钳制。
  */
 export function Set(key: string, value: string): $CancellablePromise<void> {
     return $Call.ByID(3740077226, key, value);

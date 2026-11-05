@@ -25,6 +25,7 @@ func ToSeriesDTO(s sdkmodel.SeriesSummary, fetchedAt int64) model.SeriesDTO {
 		Title:        s.Title,
 		CoverURL:     s.CoverURL,
 		EpisodeCount: s.EpisodeCount,
+		Description:  s.Description,
 		Status:       model.StatusUnknown,
 		PayType:      model.PayTypeUnknown,
 		Platform:     PlatformUnknownSummary,

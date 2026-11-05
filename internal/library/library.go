@@ -37,15 +37,20 @@ type Options struct {
 	// OnEpisodesRefreshed 可选：一次增量刷新完成后的回调，bindings 用它发
 	// episode:updated 事件（方案 §7.3 的 emit 落点）。
 	OnEpisodesRefreshed func(seriesID string, added, updated, removed int)
+	// CoverProxy 可选：把封面 URL 改写成本地代理（上游书城封面是 HEIC，
+	// WebView2 解不了，需经 localsrv 转 JPEG；见 localsrv.ImageURL）。
+	// nil = 原样返回。store 里落库的仍是原始 URL，改写只发生在读出时。
+	CoverProxy func(url string) string
 }
 
 // Service 是目录层服务。并发安全。
 type Service struct {
-	pool      *devices.Pool
-	st        store.Store
-	now       func() time.Time
-	logf      func(string, ...any)
-	onRefresh func(seriesID string, added, updated, removed int)
+	pool       *devices.Pool
+	st         store.Store
+	now        func() time.Time
+	logf       func(string, ...any)
+	onRefresh  func(seriesID string, added, updated, removed int)
+	coverProxy func(url string) string
 
 	mu sync.Mutex
 	// lastRefresh 记每部剧的上次刷新时间与结果，用于 30 秒去抖（方案 §7.4）：
@@ -82,16 +87,33 @@ func New(opts Options) (*Service, error) {
 		now:         now,
 		logf:        logf,
 		onRefresh:   opts.OnEpisodesRefreshed,
+		coverProxy:  opts.CoverProxy,
 		lastRefresh: make(map[string]time.Time, 16),
 		lastDiff:    make(map[string][3]int, 16),
 		epSeries:    make(map[string]string, 256),
 	}, nil
 }
 
+// proxyCover 统一改写封面地址：nil 时原样返回。store 落库原始 URL，
+// 改写只发生在 DTO 读出时，签名失效后重拉数据即可拿到新签名。
+func (s *Service) proxyCover(u string) string {
+	if s.coverProxy == nil {
+		return u
+	}
+	return s.coverProxy(u)
+}
+
+// proxySeriesCovers 就地改写一批剧的封面。
+func (s *Service) proxySeriesCovers(items []model.SeriesDTO) {
+	for i := range items {
+		items[i].CoverURL = s.proxyCover(items[i].CoverURL)
+	}
+}
+
 // Discover 读书城的一个频道（空频道即推荐），0 额度（方案 §8.3 Library.Discover）。
 func (s *Service) Discover(ctx context.Context, channel, cursor string) (model.SeriesPageDTO, error) {
 	var page model.SeriesPageDTO
-	err := s.pool.Do(ctx, "discover", func(ctx context.Context, c *sdkx.Client) error {
+	err := s.pool.DoReadOnly(ctx, "discover", func(ctx context.Context, c *sdkx.Client) error {
 		items, next, hasMore, err := c.Discover(ctx, sdkx.DiscoverOptions{Channel: channel, Cursor: cursor})
 		if err != nil {
 			return err
@@ -101,6 +123,7 @@ func (s *Service) Discover(ctx context.Context, channel, cursor string) (model.S
 			Cursor:  next,
 			HasMore: hasMore,
 		}
+		s.proxySeriesCovers(page.Items)
 		return nil
 	})
 	if err != nil {
@@ -115,7 +138,7 @@ func (s *Service) Search(ctx context.Context, query, cursor string) (model.Serie
 		return model.SeriesPageDTO{}, fmt.Errorf("library: search query is required")
 	}
 	var page model.SeriesPageDTO
-	err := s.pool.Do(ctx, "search", func(ctx context.Context, c *sdkx.Client) error {
+	err := s.pool.DoReadOnly(ctx, "search", func(ctx context.Context, c *sdkx.Client) error {
 		items, next, hasMore, err := c.Search(ctx, query, sdkx.SearchOptions{Cursor: cursor})
 		if err != nil {
 			return err
@@ -125,6 +148,7 @@ func (s *Service) Search(ctx context.Context, query, cursor string) (model.Serie
 			Cursor:  next,
 			HasMore: hasMore,
 		}
+		s.proxySeriesCovers(page.Items)
 		return nil
 	})
 	if err != nil {
@@ -142,7 +166,7 @@ func (s *Service) GetSeries(ctx context.Context, seriesID string) (model.SeriesD
 		return model.SeriesDTO{}, fmt.Errorf("library: series id is required")
 	}
 	var dto model.SeriesDTO
-	err := s.pool.Do(ctx, "getSeries", func(ctx context.Context, c *sdkx.Client) error {
+	err := s.pool.DoReadOnly(ctx, "getSeries", func(ctx context.Context, c *sdkx.Client) error {
 		detail, err := c.GetSeries(ctx, seriesID)
 		if err != nil {
 			return err
@@ -153,6 +177,7 @@ func (s *Service) GetSeries(ctx context.Context, seriesID string) (model.SeriesD
 	if err != nil {
 		return model.SeriesDTO{}, err
 	}
+	dto.CoverURL = s.proxyCover(dto.CoverURL)
 	if err := s.st.UpsertSeries(ctx, dto); err != nil {
 		// 缓存失败不影响展示，只记日志。
 		s.logf("library: cache series %s: %v", seriesID, err)
@@ -173,6 +198,9 @@ func (s *Service) Episodes(ctx context.Context, seriesID string) ([]model.Episod
 		return nil, err
 	}
 	s.index(seriesID, eps)
+	for i := range eps {
+		eps[i].CoverURL = s.proxyCover(eps[i].CoverURL)
+	}
 	return eps, nil
 }
 
@@ -219,7 +247,7 @@ func (s *Service) refresh(ctx context.Context, seriesID string, force bool) (add
 		}
 	}
 	var fresh []model.EpisodeDTO
-	if err := s.pool.Do(ctx, "listEpisodes", func(ctx context.Context, c *sdkx.Client) error {
+	if err := s.pool.DoReadOnly(ctx, "listEpisodes", func(ctx context.Context, c *sdkx.Client) error {
 		eps, err := c.ListEpisodes(ctx, seriesID)
 		if err != nil {
 			return err
@@ -262,12 +290,16 @@ func (s *Service) Seasons(ctx context.Context, seriesID string) (model.AlbumDTO,
 		return model.AlbumDTO{}, fmt.Errorf("library: series id is required")
 	}
 	var album model.AlbumDTO
-	err := s.pool.Do(ctx, "seasons", func(ctx context.Context, c *sdkx.Client) error {
+	err := s.pool.DoReadOnly(ctx, "seasons", func(ctx context.Context, c *sdkx.Client) error {
 		a, err := c.Seasons(ctx, seriesID)
 		if err != nil {
 			return err
 		}
 		album = sdkx.ToAlbumDTO(a)
+		album.CoverURL = s.proxyCover(album.CoverURL)
+		for i := range album.Seasons {
+			album.Seasons[i].CoverURL = s.proxyCover(album.Seasons[i].CoverURL)
+		}
 		return nil
 	})
 	if err == nil && len(album.Seasons) > 0 {
@@ -286,7 +318,7 @@ func (s *Service) Recommend(ctx context.Context, seriesID string) ([]model.Serie
 		return nil, fmt.Errorf("library: series id is required")
 	}
 	var items []model.SeriesDTO
-	err := s.pool.Do(ctx, "recommend", func(ctx context.Context, c *sdkx.Client) error {
+	err := s.pool.DoReadOnly(ctx, "recommend", func(ctx context.Context, c *sdkx.Client) error {
 		rec, err := c.SeriesRecommend(ctx, seriesID)
 		if err != nil {
 			return err
@@ -301,6 +333,7 @@ func (s *Service) Recommend(ctx context.Context, seriesID string) ([]model.Serie
 	if err != nil {
 		return nil, err
 	}
+	s.proxySeriesCovers(items)
 	return items, nil
 }
 
@@ -324,7 +357,7 @@ func (s *Service) singleSeason(ctx context.Context, seriesID string) model.Album
 	season := model.SeasonDTO{SeriesID: seriesID}
 	if cached, err := s.st.GetSeries(ctx, seriesID); err == nil && cached != nil {
 		season.Title = cached.Title
-		season.CoverURL = cached.CoverURL
+		season.CoverURL = s.proxyCover(cached.CoverURL)
 		season.EpisodeCount = cached.EpisodeCount
 		season.Status = cached.Status
 		season.Index = cached.SeasonIndex

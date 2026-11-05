@@ -57,10 +57,38 @@ else {
 }
 
 # 2) 绑定（有 wails3 就交给它，失败不静默，前端构建会暴露问题）
+# `-ts -d frontend/bindings ./cmd/app` 与 scripts/build.sh 保持一致：缺 -ts 会把
+# 入库的 .ts 绑定重写成 .js，缺 ./cmd/app 只扫仓库根、出不来绑定。
 if (Get-Command wails3 -ErrorAction SilentlyContinue) {
-    Write-Host '==> bindings: wails3 generate bindings'
-    wails3 generate bindings
+    Write-Host '==> bindings: wails3 generate bindings -ts ./cmd/app'
+    wails3 generate bindings -ts -d frontend/bindings ./cmd/app
     if ($LASTEXITCODE -ne 0) { Write-Warning 'wails3 generate bindings 失败，继续' }
+}
+
+# 2.5) Windows 资源（图标 / manifest / 版本信息）→ syso
+# 与 scripts/build.sh 的 2.5 步一致：syso 落在 main 包目录（cmd/app/），Go 链接器
+# 按 _windows_<arch> 后缀自动带入；产物 gitignore 但保留，裸 go build 也带图标。
+if ($GOOS -eq 'windows') {
+    if ($GOARCH -notin @('amd64', 'arm64', '386')) {
+        throw "windows/$GOARCH 无法生成 syso（wails3 仅支持 amd64/arm64/386）"
+    }
+    if (Get-Command wails3 -ErrorAction SilentlyContinue) {
+        foreach ($f in @('build/windows/icon.ico', 'build/windows/wails.exe.manifest', 'build/windows/info.json')) {
+            if (-not (Test-Path $f)) { throw "missing build asset: $f（源资产应入库）" }
+        }
+        $syso = Join-Path $Entry "wails_windows_$GOARCH.syso"
+        Write-Host "==> syso: wails3 generate syso -arch $GOARCH"
+        & wails3 generate syso -arch $GOARCH `
+            -icon build/windows/icon.ico `
+            -manifest build/windows/wails.exe.manifest `
+            -info build/windows/info.json `
+            -out $syso
+        if ($LASTEXITCODE -ne 0) { throw 'wails3 generate syso failed' }
+        if (-not (Test-Path $syso)) { throw "syso not produced: $syso" }
+    }
+    else {
+        Write-Warning '本机无 wails3，跳过 syso：产物可运行但没有图标/版本信息'
+    }
 }
 
 # 3) go build

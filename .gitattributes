@@ -1,0 +1,3 @@
+# wails3 generate bindings 每次构建都会重写 frontend/bindings（LF 行尾）。
+# 固定该目录为 LF，避免每次构建后出现 16 个纯行尾差异的「幽灵修改」。
+frontend/bindings/** text eol=lf

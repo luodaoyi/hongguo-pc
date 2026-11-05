@@ -4,7 +4,8 @@
 // → Wails v3 服务层 → 窗口。
 //
 // 两条启动纪律：
-//   - 前端 dist 缺失时给可读错误并退出，不 panic（资源用 http.Dir 提供，不做 embed）；
+//   - 前端产物用 go:embed 随二进制分发（发布包只有一个 exe，双击即可用，
+//     与 CWD 无关；背景见 docs/rootcause-exe-not-launch.md）；
 //   - ffmpeg 缺失不阻止启动：只有加密集播不了，界面会提示去设置页指定路径（方案 §13.3）。
 package main
 
@@ -13,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +23,7 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 
+	"github.com/luodaoyi/hongguo-pc/frontend"
 	"github.com/luodaoyi/hongguo-pc/internal/bindings"
 	"github.com/luodaoyi/hongguo-pc/internal/devices"
 	"github.com/luodaoyi/hongguo-pc/internal/library"
@@ -32,13 +33,30 @@ import (
 	"github.com/luodaoyi/hongguo-pc/internal/store"
 )
 
-// distDir 是前端构建产物目录（相对工作目录，与 wails3 build 的约定一致）。
-const distDir = "frontend/dist"
-
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "hongguo-pc:", err)
+		reportStartupError(err)
 		os.Exit(1)
+	}
+}
+
+// reportStartupError 把启动失败同时送到 stderr 与数据目录的 startup-error.log。
+//
+// 发布版以 -H windowsgui 链接，没有控制台承接 stderr——用户双击失败时看到的
+// 是「毫无反应」（docs/rootcause-exe-not-launch.md §1.3）。落一份日志到数据
+// 目录，让「打不开」至少有处可查。日志写不进去也不掩盖原始错误：stderr 仍打。
+func reportStartupError(err error) {
+	fmt.Fprintln(os.Stderr, "hongguo-pc:", err)
+	if base, dirErr := resolveDataDir(); dirErr == nil {
+		if mkErr := os.MkdirAll(base, 0o755); mkErr == nil {
+			path := filepath.Join(base, "startup-error.log")
+			f, openErr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if openErr == nil {
+				fmt.Fprintf(f, "%s 启动失败: %v\n", time.Now().Format("2006-01-02 15:04:05"), err)
+				f.Close()
+				fmt.Fprintln(os.Stderr, "hongguo-pc: 错误详情已写入", path)
+			}
+		}
 	}
 }
 
@@ -75,32 +93,43 @@ func run() error {
 		logf("数据库迁移失败，已备份并重建；备份在 %s", recovered)
 	}
 
-	// 3. 设备池。
-	pool, err := devices.NewPool(devices.Config{
-		Dir:   filepath.Join(dataDir, "devices"),
-		Store: st,
-		Logf:  logf,
-	})
-	if err != nil {
-		return fmt.Errorf("创建设备池失败: %w", err)
-	}
-
-	// 4. 设置。
+	// 3. 设置（先于设备池：槽数从设置读，改动重启生效）。
 	settings, err := bindings.NewSettingsStore(filepath.Join(dataDir, "settings.json"))
 	if err != nil {
 		return err
 	}
 
-	// 5. 本地 Range 服务（与进程同生命周期）。
-	srv, err := localsrv.New(localsrv.Config{Root: tmpRoot})
+	// 4. 设备池：每槽是一份匿名设备档案，单槽日额度约 1 次播放模型；
+	// 槽数可在设置页调整（1-16，默认 4），重启生效。
+	slots := settings.Int(bindings.KeyDeviceSlots, 4)
+	if slots < 1 {
+		slots = 1
+	}
+	if slots > 16 {
+		slots = 16
+	}
+	if slots != 4 {
+		logf("设备槽数 %d（默认 4，设置页可调，重启生效）", slots)
+	}
+	unlimited := settings.Bool(bindings.KeyUnlimitedDevices, false)
+	if unlimited {
+		logf("设备池按需无限扩槽已开启：无 healthy 槽时自动注册新匿名设备（重启生效的设置项）")
+	}
+	pool, err := devices.NewPool(devices.Config{
+		Dir:       filepath.Join(dataDir, "devices"),
+		Store:     st,
+		Logf:      logf,
+		Slots:     slots,
+		Unlimited: unlimited,
+	})
 	if err != nil {
-		return fmt.Errorf("启动本地播放服务失败: %w", err)
+		return fmt.Errorf("创建设备池失败: %w", err)
 	}
 
-	// 6. 媒体会话：ffmpeg 缺失不阻断启动，只是加密集播不了。
+	// 5. ffmpeg 探测：加密集播放与 HEIC 封面转码都用它；缺失不阻断启动。
 	ffmpegPath, ffmpegVersion, ffmpegErr := media.DetectFFmpeg(settings.Get(bindings.KeyFFmpegPath))
 	if ffmpegErr != nil {
-		logf("未找到 ffmpeg，加密集将无法播放（可在设置页指定路径）: %v", ffmpegErr)
+		logf("未找到 ffmpeg，加密集与 HEIC 封面转码将不可用（可在设置页指定路径）: %v", ffmpegErr)
 	} else {
 		logf("ffmpeg: %s (%s)", ffmpegPath, ffmpegVersion)
 	}
@@ -116,12 +145,24 @@ func run() error {
 		}
 	}
 
-	// 7. 目录层（0 额度，全部经设备池）。
+	// 6. 本地服务（Range 供播 + HEIC 封面代理），与进程同生命周期。
+	srv, err := localsrv.New(localsrv.Config{
+		Root:        tmpRoot,
+		ImgCacheDir: filepath.Join(dataDir, "cache", "img"),
+		FFmpegPath:  ffmpegPath,
+		Logf:        logf,
+	})
+	if err != nil {
+		return fmt.Errorf("启动本地播放服务失败: %w", err)
+	}
+
+	// 7. 目录层（0 额度，全部经设备池）；封面经本地代理转码（HEIC→JPEG）。
 	lib, err := library.New(library.Options{
 		Pool:                pool,
 		Store:               st,
 		Logf:                logf,
 		OnEpisodesRefreshed: bindings.EmitEpisodeUpdated,
+		CoverProxy:          srv.ImageURL,
 	})
 	if err != nil {
 		return err
@@ -138,13 +179,14 @@ func run() error {
 		return err
 	}
 	machine, err := player.New(player.Config{
-		Pool:     pool,
-		Store:    st,
-		Catalog:  lib,
-		Pipeline: pipeline,
-		AutoNext: func() bool { return settings.Bool(bindings.KeyAutoNext, true) },
-		Emit:     bindings.Emit,
-		Logf:     logf,
+		Pool:            pool,
+		Store:           st,
+		Catalog:         lib,
+		Pipeline:        pipeline,
+		AutoNext:        func() bool { return settings.Bool(bindings.KeyAutoNext, true) },
+		PrefetchEnabled: func() bool { return settings.Bool(bindings.KeyPrefetchEnabled, true) },
+		Emit:            bindings.Emit,
+		Logf:            logf,
 	})
 	if err != nil {
 		return err
@@ -164,17 +206,15 @@ func run() error {
 		return err
 	}
 
-	// 10. 前端资源：dist 缺失时给可读错误，不做 embed（方案 §11 验收口径）。
-	assets, err := distHandler(distDir)
-	if err != nil {
-		return err
-	}
+	// 10. 前端资源：go:embed 随二进制分发，双击 exe 即可用，与 CWD 无关。
+	// （v0.1.0 按 CWD 读 frontend/dist，发布包又只带 exe，导致所有正常双击
+	// 场景都起不来——docs/rootcause-exe-not-launch.md 的主因。）
 
 	serviceOptions := application.ServiceOptions{MarshalError: bindings.MarshalError}
 	app := application.New(application.Options{
 		Name:        "hongguo-pc",
 		Description: "红果短剧桌面播放器",
-		Assets:      application.AssetOptions{Handler: assets},
+		Assets:      application.AssetOptions{Handler: application.AssetFileServerFS(frontend.Dist)},
 		Services: []application.Service{
 			application.NewServiceWithOptions(&bindings.Library{Core: core}, serviceOptions),
 			application.NewServiceWithOptions(&bindings.Player{Core: core}, serviceOptions),
@@ -246,26 +286,6 @@ func resolveDataDir() (string, error) {
 		return "", fmt.Errorf("无法确定数据目录（LOCALAPPDATA 为空且取不到用户配置目录）: %w", err)
 	}
 	return filepath.Join(base, "hongguo-pc"), nil
-}
-
-// distHandler 用 http.Dir 提供前端静态资源。
-//
-// dist 不存在时返回可读错误而不是 panic：这既让 `go build ./cmd/app` 不依赖前端产物，
-// 也让第一次跑的人在终端看到「先构建前端」的提示。
-func distHandler(dir string) (http.Handler, error) {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return nil, fmt.Errorf("解析前端目录 %s 失败: %w", dir, err)
-	}
-	info, statErr := os.Stat(abs)
-	if statErr != nil || !info.IsDir() {
-		return nil, fmt.Errorf("前端资源目录不存在: %s\n请先在 frontend 目录执行 `npm ci && npm run build` 生成 dist（或用 wails3 build 打包）", abs)
-	}
-	if _, indexErr := os.Stat(filepath.Join(abs, "index.html")); indexErr != nil {
-		return nil, fmt.Errorf("前端资源不完整: %s 缺少 index.html\n请重新执行 `npm run build`", abs)
-	}
-	files := http.FileServer(http.Dir(abs))
-	return files, nil
 }
 
 // newSessionID 给本次运行的临时目录取个短名（进程内唯一）。

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -17,6 +19,9 @@ const (
 	KeyAlwaysOnTop       = "alwaysOnTop"       // 置顶（默认 false）
 	KeyContentProtection = "contentProtection" // 防截屏（默认 false，方案 §8.5）
 	KeyFirstRunDone      = "firstRunDone"      // 首启引导是否走完（方案 §13.3）
+	KeyDeviceSlots       = "deviceSlots"       // 设备槽数（默认 4，范围 1-16，重启生效）
+	KeyPrefetchEnabled   = "prefetchEnabled"   // 连播预取（默认 true；关闭每集省 1 台设备）
+	KeyUnlimitedDevices  = "unlimitedDevices"  // 按需无限注册匿名设备（默认 false，重启生效）
 )
 
 // SettingsStore 是本地设置存储：一个 JSON 文件，键值都是字符串。
@@ -96,6 +101,19 @@ func (s *SettingsStore) Bool(key string, def bool) bool {
 	}
 }
 
+// Int 读一个整数设置项，缺失或无法解析时取 def。
+func (s *SettingsStore) Int(key string, def int) int {
+	v := strings.TrimSpace(s.Get(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
 // saveLocked 把设置写回文件（调用方持锁）。
 func (s *SettingsStore) saveLocked() error {
 	data, err := json.MarshalIndent(s.values, "", "  ")
@@ -118,10 +136,24 @@ func (s *Settings) Get(ctx context.Context, key string) (string, error) {
 	return s.Core.Settings.Get(key), nil
 }
 
-// Set 写一个设置项。ffmpegPath 立即生效：Media.DetectFFmpeg 每次都读最新值。
+// Set 写一个设置项。ffmpegPath 立即生效：Media.DetectFFmpeg 每次都读最新值；
+// deviceSlots 需要重启（设备池在启动时按槽数构建），这里只做范围钳制。
 func (s *Settings) Set(ctx context.Context, key, value string) error {
 	if key == "" {
 		return fmt.Errorf("bindings: settings key is required")
+	}
+	if key == KeyDeviceSlots {
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("bindings: deviceSlots 必须是整数: %w", err)
+		}
+		if n < 1 {
+			n = 1
+		}
+		if n > 16 {
+			n = 16
+		}
+		value = strconv.Itoa(n)
 	}
 	if err := s.Core.Settings.Set(key, value); err != nil {
 		s.Core.record(err)

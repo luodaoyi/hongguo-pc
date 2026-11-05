@@ -18,6 +18,8 @@ export interface Series {
   title: string;
   coverUrl?: string;
   episodeCount: number;
+  /** 上游简介原文；store 缓存读回时为空 */
+  description?: string;
   status: SeriesStatus | string;
   payType: PayType | string;
   /** 0 = 书 / 有声书等非视频内容；-1 = 只有列表数据、平台未知 */

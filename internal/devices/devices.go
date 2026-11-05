@@ -77,6 +77,9 @@ type Config struct {
 	Logf func(format string, args ...any)
 	// NewClient 可选：注入客户端构造（测试用），默认 sdkx.New。
 	NewClient func(profilePath string, onRejected func(error)) (*sdkx.Client, error)
+	// Unlimited 开启后，播放路径在没有 healthy 槽时按需注册一台新匿名设备并
+	// 立即用于本次解析（池无硬上限）。仅由显式设置项打开。
+	Unlimited bool
 }
 
 // Pool 是设备池。并发安全。
@@ -94,6 +97,13 @@ type Pool struct {
 	logfFn           func(string, ...any)
 	keys             *Keyring
 	nonPlaybackSwaps int
+
+	// 按需扩槽的构造参数与并发单飞：多个请求同时缺槽时只新建一台。
+	dir       string
+	newClient func(profilePath string, onRejected func(error)) (*sdkx.Client, error)
+	unlimited bool
+	growing   bool
+	growWait  chan struct{}
 }
 
 // NewPool 建池：确保目录存在、按 id 建槽、并从 device_slot 表恢复记账。
@@ -147,6 +157,9 @@ func NewPool(cfg Config) (*Pool, error) {
 		now:              nowFn,
 		logfFn:           logf,
 		keys:             NewKeyring(),
+		dir:              dir,
+		newClient:        newClient,
+		unlimited:        cfg.Unlimited,
 	}
 	for i := 0; i < slots; i++ {
 		id := fmt.Sprintf("d%03d", i+1)
@@ -161,6 +174,67 @@ func NewPool(cfg Config) (*Pool, error) {
 	}
 	p.restore()
 	return p, nil
+}
+
+// growSlot 按需新建一个匿名设备槽并挂到池尾。构造不发网络请求（档案在首次
+// 目录/播放调用时才注册）；并发时由 growing/growWait 单飞，多个缺槽请求共用
+// 同一次新建结果，避免瞬间批量建档。返回的槽已标记 busy，调用方负责 Release。
+func (p *Pool) growSlot(ctx context.Context) (*Slot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for {
+		p.mu.Lock()
+		if !p.unlimited {
+			p.mu.Unlock()
+			return nil, ErrQuotaExhausted
+		}
+		if p.growing {
+			wait := p.growWait
+			p.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-wait:
+				// 等新建完成后重新走一遍常规选槽（可能已被别的请求占走）。
+				return p.Acquire(ctx)
+			}
+		}
+		p.growing = true
+		p.growWait = make(chan struct{})
+		id := fmt.Sprintf("d%03d", len(p.slots)+1)
+		profilePath := filepath.Join(p.dir, id+".json")
+		p.mu.Unlock()
+
+		s := &Slot{ID: id, ProfilePath: profilePath, state: model.SlotHealthy}
+		client, err := p.newClient(profilePath, func(error) { p.NoteDeviceRejected(s) })
+		if err != nil {
+			p.finishGrow()
+			return nil, fmt.Errorf("devices: create client for on-demand slot %s: %w", id, err)
+		}
+		s.client = client
+		s.busy = true
+
+		p.mu.Lock()
+		p.slots = append(p.slots, s)
+		p.persistLocked(s)
+		p.mu.Unlock()
+		p.logf("devices: on-demand slot %s registered (pool size %d)", id, len(p.slots))
+		p.finishGrow()
+		return s, nil
+	}
+}
+
+// finishGrow 结束一次扩槽并唤醒等待者。调用方不得持有 p.mu。
+func (p *Pool) finishGrow() {
+	p.mu.Lock()
+	p.growing = false
+	wait := p.growWait
+	p.growWait = make(chan struct{})
+	p.mu.Unlock()
+	if wait != nil {
+		close(wait)
+	}
 }
 
 // Keys 返回本会话的密钥表。上层（player/media 接线）从这里取密钥串，
@@ -245,6 +319,10 @@ func (p *Pool) Acquire(ctx context.Context) (*Slot, error) {
 		}
 		if !anyBusy {
 			p.mu.Unlock()
+			// 播放解析没有 healthy 槽：按需扩槽（Unlimited 开启），否则照旧报耗尽。
+			if p.unlimited {
+				return p.growSlot(ctx)
+			}
 			return nil, ErrQuotaExhausted
 		}
 		wait := p.waitCh
@@ -269,6 +347,65 @@ func (p *Pool) Release(s *Slot) {
 	}
 	s.busy = false
 	p.broadcastLocked()
+}
+
+// AcquireAny 取一个能执行 0 额度目录调用的槽：优先 healthy，其次 cooling、
+// exhausted、rejected。0 额度调用不消耗播放额度，非 healthy 槽的签名依然有效；
+// 否则播放额度耗尽后连浏览、选集都被拦死，与界面承诺的口径矛盾。
+// 没有任何空闲槽时与 Acquire 相同：等忙槽释放或返回 ErrQuotaExhausted。
+func (p *Pool) AcquireAny(ctx context.Context) (*Slot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for {
+		p.mu.Lock()
+		now := p.now()
+		var best *Slot
+		bestRank := 0
+		haveBest := false
+		anyBusy := false
+		for _, s := range p.slots {
+			p.refreshLocked(s, now)
+			if s.busy {
+				anyBusy = true
+				continue
+			}
+			rank := slotReadRank(s.state)
+			if !haveBest || rank < bestRank || (rank == bestRank && s.lastUsed.Before(best.lastUsed)) {
+				best, bestRank, haveBest = s, rank, true
+			}
+		}
+		if best != nil {
+			best.busy = true
+			p.mu.Unlock()
+			return best, nil
+		}
+		if !anyBusy {
+			p.mu.Unlock()
+			return nil, ErrQuotaExhausted
+		}
+		wait := p.waitCh
+		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-wait:
+		}
+	}
+}
+
+// slotReadRank 是只读调用的槽优先级：数值越小越优先。
+func slotReadRank(state string) int {
+	switch state {
+	case model.SlotHealthy:
+		return 0
+	case model.SlotCooling:
+		return 1
+	case model.SlotExhausted:
+		return 2
+	default:
+		return 3 // rejected：签名仍可用；调用被拒会走 Do 的换档路径
+	}
 }
 
 // Commit 记一次成功的播放解析：该槽消耗 1 次额度，并且当场置为 exhausted。
@@ -454,7 +591,9 @@ func (p *Pool) refreshLocked(s *Slot, now time.Time) {
 			s.coolUntil = time.Time{}
 		}
 	case model.SlotExhausted:
-		if p.newQuotaWindow(s, now) {
+		// lastUsed 为空说明该槽还没真实消耗过额度（构造初值/记账异常），
+		// 不按「新窗口」复原，避免刚标记的 exhausted 被立刻洗回 healthy。
+		if !s.lastUsed.IsZero() && p.newQuotaWindow(s, now) {
 			s.state = model.SlotHealthy
 			s.quotaUsed = 0
 			s.quotaDay = dayKey(now)

@@ -124,7 +124,7 @@ func Describe(err error) Failure {
 	}
 	switch {
 	case errors.Is(err, devices.ErrQuotaExhausted):
-		return Failure{Code: CodeQuotaExhausted, Message: "今日可播放集数已用尽（匿名额度限制），明天恢复", Retryable: false}
+		return Failure{Code: CodeQuotaExhausted, Message: "今日可播放集数已用尽（匿名额度限制），明天恢复。可在设置页调大设备槽数（重启生效）或关闭连播预取省额度", Retryable: false}
 	case errors.Is(err, devices.ErrRateLimitedLong):
 		return Failure{Code: CodeRateLimitedLong, Message: "服务端要求等待较久，已放弃本次重试，请稍后再试", Retryable: true}
 	case errors.Is(err, ErrNoNextEpisode):
@@ -206,6 +206,9 @@ type Config struct {
 	Mode Mode
 	// AutoNext 可选：读「自动下一集」开关（设置项）。nil 视为开启。
 	AutoNext func() bool
+	// PrefetchEnabled 可选：读「连播预取」开关（设置项）。nil 视为开启。
+	// 预取让下一集开播零等待，但每集多消耗 1 台设备；关闭可省一半额度。
+	PrefetchEnabled func() bool
 	// Emit 可选：事件发射器（bindings 接 app.Event.Emit）。nil 时不发事件。
 	Emit func(event string, payload any)
 	// Now 可选：注入时钟，默认 time.Now。
@@ -224,6 +227,8 @@ type Machine struct {
 	now      func() time.Time
 	logf     func(string, ...any)
 	autoNext func() bool
+	// prefetchOn 读「连播预取」开关；预取每集多耗 1 台设备（方案 §4.4）。
+	prefetchOn func() bool
 
 	mu    sync.Mutex
 	mode  Mode
@@ -303,6 +308,10 @@ func New(cfg Config) (*Machine, error) {
 	if autoNext == nil {
 		autoNext = func() bool { return true }
 	}
+	prefetchEnabled := cfg.PrefetchEnabled
+	if prefetchEnabled == nil {
+		prefetchEnabled = func() bool { return true }
+	}
 	mode := cfg.Mode
 	if mode == "" {
 		mode = ModeSequential
@@ -320,6 +329,7 @@ func New(cfg Config) (*Machine, error) {
 		now:        now,
 		logf:       logf,
 		autoNext:   autoNext,
+		prefetchOn: prefetchEnabled,
 		mode:       mode,
 		state:      StateIdle,
 		prefetched: make(map[string]bool, 8),

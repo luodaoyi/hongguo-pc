@@ -299,6 +299,12 @@ export class SeriesDTO {
     "episodeCount": number;
 
     /**
+     * Description 是上游的简介原文（书城/搜索列表就带）。只用于瀑布流卡片摘要；
+     * store 不落库，缓存读回时为空。
+     */
+    "description"?: string;
+
+    /**
      * Status 取 updating | finished | updated_today | stopped | unknown。
      */
     "status": string;

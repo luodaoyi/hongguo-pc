@@ -34,6 +34,7 @@
 ## 运行依赖
 
 程序本身不打包媒体工具链，下列依赖需要用户自备或由系统提供。
+前端产物已通过 `go:embed` 打进二进制（v0.1.1 起），发布包解压即用，不需要 `frontend/dist`。
 
 | 平台 | 依赖 | 说明 |
 |---|---|---|
@@ -41,6 +42,9 @@
 | Linux | **GTK4 + WebKitGTK 6.0** 运行时 | Debian/Ubuntu：`libgtk-4-1 libwebkitgtk-6.0-4`。本项目基于 Wails v3.1，默认就是 GTK4/WebKitGTK 6.0 路径，**不提供**旧的 GTK3/WebKit2GTK 4.1 构建（v3.1 已移除 `-tags gtk3`）。发行二进制在 Ubuntu 24.04 上构建，更老的发行版未验证。 |
 | macOS | macOS 11+ | 见下方「macOS 未签名说明」。 |
 | 所有平台 | **ffmpeg**（必需，自备） | 用于解密 `cenc-aes-ctr` 分集与本地转封装。仓库**不附带**、不下载、也不再分发 ffmpeg。用户本机自行安装的 ffmpeg 若是 GPLv3 构建，**该二进制不可由本项目再分发**；本项目只调用用户已安装的可执行文件。 |
+
+> **打不开时先看日志**：Windows 发布版无控制台，启动失败时错误会追加写入
+> `%LOCALAPPDATA%\hongguo-pc\startup-error.log`；先把该文件最后一行发出来再排查。
 
 ## 构建
 
@@ -63,6 +67,12 @@ bash scripts/package.sh                      # 打包到 dist/
 
 `Taskfile.yml` 只是入口包装（`task build` / `task package`），逻辑都在 `scripts/` 下，避免两处维护。
 若仓库后续接入 wails3 的标准骨架（`build/Taskfile.yml`），构建会自动优先走 `wails3 build` / `wails3 package`，本仓库的脚本退为兜底路径。
+
+构建要点：
+
+- **前端产物内嵌**（`frontend/embed.go` 的 `//go:embed all:dist`）：必须先构建前端再 `go build`，dist 缺失是**编译期**报错。
+- **Windows 图标 / manifest / 版本信息**：`wails3 generate syso` 生成 `cmd/app/wails_windows_<arch>.syso` 后由链接器自动带入；本机无 wails3 时产物可运行但没有图标（构建脚本会提示）。
+- **发布前自检**：`pwsh -NoProfile -File scripts/verify-pe.ps1`（GUI 子系统、图标/manifest/版本资源、info.json 字符串三关）。
 
 ### CI / 发布
 

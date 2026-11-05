@@ -8,6 +8,7 @@ package localsrv
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -23,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/luodaoyi/hongguo-pc/internal/media"
 )
 
 const mimeVideoMP4 = "video/mp4"
@@ -30,18 +33,33 @@ const mimeVideoMP4 = "video/mp4"
 // ErrClosed 表示服务已关闭。
 var ErrClosed = errors.New("localsrv: 服务已关闭")
 
+// imgHostSuffixes 是封面代理允许回源的域名后缀（小写）。封面只来自上游图片
+// CDN；白名单防 SSRF（拒绝内网/任意地址）。出现新图床时在这里补。
+var imgHostSuffixes = []string{".fqnovelpic.com", ".byteimg.com"}
+
 // Config 是本地服务的配置。Root 是临时文件根目录；非空时 URL 只接受该目录内的
 // 文件，防止调用方传错路径把任意文件端出去。
 type Config struct {
 	Root string
+	// ImgCacheDir 是封面转码产物的磁盘缓存目录（空 = 不做封面代理）。
+	ImgCacheDir string
+	// FFmpegPath 用于 HEIC 封面转 JPEG；空 = 不转码，原样回源（浏览器自行降级）。
+	FFmpegPath string
+	// Logf 可选诊断日志（只打 host 与结果，不打完整签名 URL）。
+	Logf func(format string, args ...any)
 }
 
 // Server 是本地 Range 服务。
 type Server struct {
-	ln      net.Listener
-	httpSrv *http.Server
-	token   string
-	root    string
+	ln          net.Listener
+	httpSrv     *http.Server
+	token       string
+	root        string
+	imgCacheDir string
+	ffmpegPath  string
+	logf        func(format string, args ...any)
+	imgClient   *http.Client
+	imgMu       sync.Mutex // 同一封面的取源+转码互斥（小文件，全局锁足够）
 
 	mu       sync.RWMutex
 	episodes map[string]string // episodeID -> 绝对文件路径
@@ -63,18 +81,35 @@ func New(cfg Config) (*Server, error) {
 		}
 		root = absRoot
 	}
+	logf := cfg.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	imgCacheDir := strings.TrimSpace(cfg.ImgCacheDir)
+	if imgCacheDir != "" {
+		if err := os.MkdirAll(imgCacheDir, 0o755); err != nil {
+			// 缓存目录建不出来只降级为「不缓存、每次现取」，不阻断启动。
+			logf("localsrv: 封面缓存目录不可用，封面代理退化为直取: %v", err)
+			imgCacheDir = ""
+		}
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("localsrv: 监听回环地址失败: %w", err)
 	}
 	s := &Server{
-		ln:       ln,
-		token:    token,
-		root:     root,
-		episodes: make(map[string]string),
+		ln:          ln,
+		token:       token,
+		root:        root,
+		imgCacheDir: imgCacheDir,
+		ffmpegPath:  strings.TrimSpace(cfg.FFmpegPath),
+		logf:        logf,
+		imgClient:   &http.Client{Timeout: 20 * time.Second},
+		episodes:    make(map[string]string),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v/", s.serve)
+	mux.HandleFunc("/img", s.serveImage)
 	s.httpSrv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -125,6 +160,206 @@ func (s *Server) Remove(episodeID string) {
 	s.mu.Lock()
 	delete(s.episodes, episodeID)
 	s.mu.Unlock()
+}
+
+// ImageURL 把需要本地转码的远端封面（HEIC）改写成带会话 token 的本机代理地址；
+// 空串与非 .heic 的 URL（分集剧照是 jpeg）原样返回，浏览器直连 CDN。
+// 注意按 path 后缀判断：签名 URL 的 query（x-expires/x-signature）会盖掉结尾。
+// 服务已关闭时原样返回（界面拿到失效地址会走加载失败的兜底）。
+func (s *Server) ImageURL(remote string) string {
+	if !isHEICURL(remote) {
+		return remote
+	}
+	s.mu.RLock()
+	closed, addr, token := s.closed, s.ln.Addr().String(), s.token
+	s.mu.RUnlock()
+	if closed || token == "" {
+		return remote
+	}
+	q := url.Values{}
+	q.Set("u", remote)
+	q.Set("t", token)
+	return "http://" + addr + "/img?" + q.Encode()
+}
+
+// serveImage 是 HEIC 封面的本地代理：带 token 校验 + 图床白名单，命中磁盘缓存
+// 直接回；否则回源下载、按嗅探结果转码 JPEG（ffmpeg 缺失/失败回退原始字节）。
+// 错误分支只给状态码，不回显原因，与 /v/ 的纪律一致。
+func (s *Server) serveImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.tokenOK(r.URL.Query().Get("t")) {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	remote := strings.TrimSpace(r.URL.Query().Get("u"))
+	parsed, err := url.Parse(remote)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || !imgHostAllowed(parsed.Hostname()) {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	sum := sha256.Sum256([]byte(remote))
+	name := hex.EncodeToString(sum[:])
+	jpeg := filepath.Join(s.imgCacheDir, name+".jpg")
+	orig := filepath.Join(s.imgCacheDir, name+".orig")
+	if s.imgCacheDir != "" {
+		if fi, err := os.Stat(jpeg); err == nil && fi.Size() > 0 {
+			s.serveImageFile(w, r, jpeg, "image/jpeg")
+			return
+		}
+		if fi, err := os.Stat(orig); err == nil && fi.Size() > 0 {
+			mt, _ := os.ReadFile(filepath.Join(s.imgCacheDir, name+".mime"))
+			ct := strings.TrimSpace(string(mt))
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			s.serveImageFile(w, r, orig, ct)
+			return
+		}
+	}
+
+	s.imgMu.Lock()
+	defer s.imgMu.Unlock()
+	// 双重检查：等锁期间可能已被并发请求转好。
+	if s.imgCacheDir != "" {
+		if fi, err := os.Stat(jpeg); err == nil && fi.Size() > 0 {
+			s.serveImageFile(w, r, jpeg, "image/jpeg")
+			return
+		}
+	}
+
+	data, ctype, err := s.fetchRemote(r.Context(), remote)
+	if err != nil {
+		s.logf("localsrv: 封面回源失败 %s: %v", parsed.Hostname(), err)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+
+	if !media.IsHEIC(ctype, data) {
+		// 非 HEIC（理论上不会走到：ImageURL 只改写 .heic）按原字节缓存回源。
+		s.serveOrCacheRaw(w, r, s.imgCacheDir, name, ctype, data)
+		return
+	}
+
+	if s.ffmpegPath == "" || s.imgCacheDir == "" {
+		s.serveRaw(w, ctype, data)
+		return
+	}
+	src := filepath.Join(s.imgCacheDir, name+".heic.tmp")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		s.serveRaw(w, ctype, data)
+		return
+	}
+	if err := media.TranscodeHEIC(context.Background(), s.ffmpegPath, src, jpeg); err != nil {
+		os.Remove(src)
+		s.logf("localsrv: 封面转码失败 %s: %v", parsed.Hostname(), err)
+		s.serveRaw(w, ctype, data)
+		return
+	}
+	os.Remove(src)
+	s.serveImageFile(w, r, jpeg, "image/jpeg")
+}
+
+// fetchRemote 下载远端封面，上限 4MB（封面实际 ~40KB，超限视为异常直接断）。
+func (s *Server) fetchRemote(ctx context.Context, remote string) ([]byte, string, error) {
+	c, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(c, http.MethodGet, remote, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := s.imgClient.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	return data, resp.Header.Get("Content-Type"), nil
+}
+
+// serveOrCacheRaw 把非 HEIC 的原始字节缓存为 <name>.orig（mime 记 sidecar）并回源。
+func (s *Server) serveOrCacheRaw(w http.ResponseWriter, r *http.Request, dir, name, ctype string, data []byte) {
+	if dir != "" {
+		_ = os.WriteFile(filepath.Join(dir, name+".orig"), data, 0o644)
+		_ = os.WriteFile(filepath.Join(dir, name+".mime"), []byte(ctype), 0o644)
+	}
+	s.serveRaw(w, ctype, data)
+}
+
+// serveRaw 用嗅探出的 Content-Type 回原始字节（HEIC 转码不可用时的兜底：
+// 浏览器解不了会走 onError，界面已有首字/灰盒降级）。
+func (s *Server) serveRaw(w http.ResponseWriter, ctype string, data []byte) {
+	if strings.TrimSpace(ctype) == "" {
+		ctype = http.DetectContentType(data)
+	}
+	h := w.Header()
+	h.Set("Content-Type", ctype)
+	h.Set("Content-Length", strconv.Itoa(len(data)))
+	h.Set("Cache-Control", "no-store")
+	h.Del("Server")
+	w.WriteHeader(http.StatusOK)
+	if data != nil {
+		_, _ = w.Write(data)
+	}
+}
+
+// serveImageFile 回一张已缓存的图片文件。
+func (s *Server) serveImageFile(w http.ResponseWriter, r *http.Request, path, ctype string) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", ctype)
+	h.Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
+	h.Set("Cache-Control", "public, max-age=604800")
+	h.Del("Server")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = io.Copy(w, f)
+}
+
+// imgHostAllowed 按后缀白名单校验回源主机（防 SSRF：拒绝内网/任意域名）。
+func imgHostAllowed(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, suffix := range imgHostSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// isHEICURL 判断远端地址的 path 是否以 .heic 结尾（带签名 query 的 URL 同样适用）。
+func isHEICURL(remote string) bool {
+	parsed, err := url.Parse(remote)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(parsed.Path), ".heic")
 }
 
 // Close 停止监听并撤销全部 token。

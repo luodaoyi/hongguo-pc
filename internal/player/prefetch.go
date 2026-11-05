@@ -36,6 +36,9 @@ func (m *Machine) maybePrefetch(episodeID string, positionSec float64) {
 	if !m.autoNext() {
 		return
 	}
+	if !m.prefetchOn() {
+		return // 设置项「连播预取」关闭：每集省 1 台设备，下一集起播稍慢
+	}
 	if positionSec < prefetchMinPlayed.Seconds() {
 		return // 闸门 2：已播 ≥60 秒
 	}

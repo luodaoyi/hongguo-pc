@@ -5,14 +5,26 @@ import { getEventStatus } from '../events';
 import type { DevicesStatus, FFmpegInfo } from '../types';
 
 const FFMPEG_KEY = 'ffmpegPath';
+const DEVICE_SLOTS_KEY = 'deviceSlots';
+const PREFETCH_KEY = 'prefetchEnabled';
+const UNLIMITED_KEY = 'unlimitedDevices';
 
-/** 设置页（最简）：ffmpeg 路径、设备池状态、清空数据（方案 §8.1）。 */
+/** 设置页（最简）：ffmpeg 路径、播放与额度、设备池状态、清空数据（方案 §8.1）。 */
 export function SettingsPage() {
   const [ffmpeg, setFfmpeg] = useState<FFmpegInfo | null>(null);
   const [ffmpegPath, setFfmpegPath] = useState('');
   const [detecting, setDetecting] = useState(false);
   const [ffmpegError, setFfmpegError] = useState<string | null>(null);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+
+  const [slotsInput, setSlotsInput] = useState('4');
+  const [slotsMessage, setSlotsMessage] = useState<string | null>(null);
+
+  const [prefetch, setPrefetch] = useState(true);
+  const [prefetchMessage, setPrefetchMessage] = useState<string | null>(null);
+
+  const [unlimited, setUnlimited] = useState(false);
+  const [unlimitedMessage, setUnlimitedMessage] = useState<string | null>(null);
 
   const [devices, setDevices] = useState<DevicesStatus | null>(null);
   const [devicesError, setDevicesError] = useState<string | null>(null);
@@ -55,8 +67,65 @@ export function SettingsPage() {
       .catch(() => {
         // Settings.Get 未实现时不影响其它设置项，路径仍可手填并显示探测结果。
       });
-    // 只跑一次：以上三个调用都是只读状态拉取（仓库未配 eslint，此处靠约定）。
+    void api
+      .settingsGet(DEVICE_SLOTS_KEY)
+      .then((value) => {
+        if (typeof value === 'string' && value !== '') setSlotsInput(value);
+      })
+      .catch(() => {});
+    void api
+      .settingsGet(PREFETCH_KEY)
+      .then((value) => {
+        if (typeof value === 'string' && value !== '') setPrefetch(value !== 'false');
+      })
+      .catch(() => {});
+    void api
+      .settingsGet(UNLIMITED_KEY)
+      .then((value) => {
+        if (typeof value === 'string' && value !== '') setUnlimited(value === 'true');
+      })
+      .catch(() => {});
+    // 只跑一次：以上调用都是只读状态拉取（仓库未配 eslint，此处靠约定）。
   }, []);
+
+  const saveSlots = async () => {
+    setSlotsMessage(null);
+    const n = Number(slotsInput.trim());
+    if (!Number.isInteger(n) || n < 1 || n > 16) {
+      setSlotsMessage('设备槽数须是 1-16 的整数。');
+      return;
+    }
+    try {
+      await api.settingsSet(DEVICE_SLOTS_KEY, String(n));
+      setSlotsMessage('已保存，重启应用后生效。');
+    } catch (err) {
+      setSlotsMessage(`保存失败：${errorMessage(err)}`);
+    }
+  };
+
+  const togglePrefetch = async (on: boolean) => {
+    setPrefetch(on);
+    setPrefetchMessage(null);
+    try {
+      await api.settingsSet(PREFETCH_KEY, on ? 'true' : 'false');
+      setPrefetchMessage(on ? '连播预取已开启（立即生效）。' : '连播预取已关闭（立即生效，下一集起播稍慢）。');
+    } catch (err) {
+      setPrefetchMessage(`保存失败：${errorMessage(err)}`);
+      setPrefetch(!on);
+    }
+  };
+
+  const toggleUnlimited = async (on: boolean) => {
+    setUnlimited(on);
+    setUnlimitedMessage(null);
+    try {
+      await api.settingsSet(UNLIMITED_KEY, on ? 'true' : 'false');
+      setUnlimitedMessage(on ? '已开启，重启应用后生效。' : '已关闭，重启应用后生效。');
+    } catch (err) {
+      setUnlimitedMessage(`保存失败：${errorMessage(err)}`);
+      setUnlimited(!on);
+    }
+  };
 
   const saveFFmpegPath = async () => {
     setSaveMessage(null);
@@ -131,6 +200,50 @@ export function SettingsPage() {
             </li>
           </ul>
         ) : null}
+      </section>
+
+      <section className="panel">
+        <h2 className="panel__title">播放与额度</h2>
+        <p className="panel__hint">
+          每集播放消耗 1 台匿名设备（当日额度，24 小时窗口）；连播预取会让下一集提前解析，再消耗
+          1 台。额度耗尽时浏览与选集不受影响，播放等窗口恢复。
+        </p>
+        <div className="field">
+          <label className="field__label" htmlFor="device-slots">
+            设备槽数（1-16，重启生效）
+          </label>
+          <input
+            id="device-slots"
+            className="field__input"
+            type="number"
+            min={1}
+            max={16}
+            value={slotsInput}
+            onChange={(event) => setSlotsInput(event.target.value)}
+          />
+          <button className="button" type="button" onClick={() => void saveSlots()}>
+            保存
+          </button>
+        </div>
+        {slotsMessage ? <p className="panel__hint">{slotsMessage}</p> : null}
+        <label className="toggle">
+          <input
+            type="checkbox"
+            checked={prefetch}
+            onChange={(event) => void togglePrefetch(event.target.checked)}
+          />
+          连播预取（下一集零等待；关闭后每集省 1 台设备，起播稍慢）
+        </label>
+        {prefetchMessage ? <p className="panel__hint">{prefetchMessage}</p> : null}
+        <label className="toggle">
+          <input
+            type="checkbox"
+            checked={unlimited}
+            onChange={(event) => void toggleUnlimited(event.target.checked)}
+          />
+          按需无限注册匿名设备（无 healthy 槽时自动新建并立即用于播放，重启生效）
+        </label>
+        {unlimitedMessage ? <p className="panel__hint">{unlimitedMessage}</p> : null}
       </section>
 
       <section className="panel">

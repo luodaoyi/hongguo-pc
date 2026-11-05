@@ -16,6 +16,9 @@ type SeriesDTO struct {
 	Title        string `json:"title"`
 	CoverURL     string `json:"coverUrl,omitempty"`
 	EpisodeCount int    `json:"episodeCount"`
+	// Description 是上游的简介原文（书城/搜索列表就带）。只用于瀑布流卡片摘要；
+	// store 不落库，缓存读回时为空。
+	Description string `json:"description,omitempty"`
 	// Status 取 updating | finished | updated_today | stopped | unknown。
 	Status string `json:"status"`
 	// PayType 取 free | vip | single | unknown。
