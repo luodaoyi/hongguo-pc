@@ -1,0 +1,2 @@
+# 截图核对用的临时产物（mock runtime、harness 构建输出），不入库
+.screens/

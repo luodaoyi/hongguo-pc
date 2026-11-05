@@ -1,0 +1,25 @@
+# 本地数据（设备档案、SQLite、解密临时文件），绝不入库
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.db.bak-*
+/tmp/
+
+# 构建产物
+/bin/
+/build/
+/dist/
+*.exe
+
+# Wails v3 生成物（T10 起）
+# frontend/bindings/ 由 `wails3 generate bindings -ts -d frontend/bindings ./cmd/app` 生成，
+# 生成物入库（首辅裁断：CI 先 npm run build 再 wails3 build，不入库首跑必红）。
+frontend/dist/
+frontend/node_modules/
+
+# 工具与系统
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

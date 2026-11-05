@@ -1,0 +1,52 @@
+# Taskfile.yml —— 最小可用版
+#
+# 说明（重要）：
+# 1. 这是给「还没有 wails3 生成的 build/ 资产」的仓库用的兜底 Taskfile。
+#    一旦 build/Taskfile.yml 落地（wails3 init 的标准骨架），wails3 build
+#    会自己接管构建，本文件不参与，二者不冲突。
+# 2. 目标平台通过**环境变量**传：GOOS / GOARCH / APP_NAME / OUT_DIR。
+#    不要写 `task build GOOS=linux`（Task 会把它当模板变量，本文件没有声明）。
+#    正确写法：`GOOS=linux GOARCH=amd64 task build`（PowerShell 里先 $env:GOOS = 'linux'）。
+# 3. 所有实际逻辑都在 scripts/ 下，Taskfile 只做入口，避免逻辑两处维护。
+version: '3'
+
+silent: true
+
+tasks:
+  default:
+    desc: "列出所有任务"
+    cmds:
+      - task --list
+
+  build:
+    desc: "构建当前平台（env 变量 GOOS / GOARCH / APP_NAME）"
+    cmds:
+      - bash scripts/build.sh
+
+  build:app:
+    desc: "构建 macOS .app（仅 darwin 目标）"
+    cmds:
+      - bash scripts/build.sh --app
+
+  package:
+    desc: "把 bin/ 打成 dist/ 发布包（env 变量 GOOS / GOARCH）"
+    deps: [build]
+    cmds:
+      - bash scripts/package.sh
+
+  build:all:
+    desc: "本机依次构建 linux / windows / 宿主平台（仅冒烟，不做交叉编译）"
+    cmds:
+      - bash scripts/build.sh
+      - GOOS=linux bash scripts/build.sh
+      - GOOS=windows bash scripts/build.sh
+
+  clean:
+    desc: "清理构建产物（不会动 data/ 与源码）"
+    cmds:
+      - rm -rf bin dist
+
+  dev:
+    desc: "启动 wails3 开发模式（需要 wails3 在 PATH 中）"
+    cmds:
+      - wails3 dev

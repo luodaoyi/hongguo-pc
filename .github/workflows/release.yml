@@ -1,0 +1,219 @@
+# .github/workflows/release.yml
+#
+# 六平台发布流水线：linux/windows/macos × amd64/arm64
+#
+# 设计要点（与 T6 事实清单一致）：
+# 1. runner 标签都是本轮实测可用的：
+#    ubuntu-24.04 / ubuntu-24.04-arm / windows-latest / windows-11-arm / macos-26
+#    注意：macOS 13 的镜像已不存在，macOS 14 的镜像自 2026-11-02 起从 Actions 退役，
+#    两者都不能出现在 runner 标签里（详情见 T6 事实清单）。
+#    darwin/amd64 采用「在 macos-26(arm64) 上 GOARCH=amd64 交叉」的保守方案；
+#    备选是改用 macos-26-intel（标准 x64 镜像，未验证公共仓库是否需额外开通）。
+# 2. 构建与发布分离：六个 build 作业只 upload-artifact；
+#    由单独的 release 作业统一下载后调一次 action-gh-release。
+#    六个作业并发创建同一个 Release 会互相踩（422 already_exists），单点上传没有这个问题。
+# 3. 构建优先走 wails3（build/Taskfile.yml 存在时），否则走 scripts/build.sh 纯 Go 路径。
+#    两条路径产出都落到 bin/，打包统一交给 scripts/package.sh。
+# 4. 不单独跑 generate bindings（wails3 build 的 Taskfile 依赖链里已有）；
+#    不把 doctor 当门禁（它只做本机自检）。
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: hongguo-pc
+  # 钉死版本：wails v3 按周发小版本，@latest 会随机漂移。
+  WAILS_VERSION: v3.1.0
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04,     goos: linux,   goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, goos: linux,   goarch: arm64 }
+          - { runner: windows-latest,   goos: windows, goarch: amd64 }
+          - { runner: windows-11-arm,   goos: windows, goarch: arm64 }
+          - { runner: macos-26,         goos: darwin,  goarch: arm64 }
+          # darwin/amd64 在 arm64 runner 上交叉编译；若首跑失败，改 runner 为 macos-26-intel
+          - { runner: macos-26,         goos: darwin,  goarch: amd64 }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          # wails v3 要求 Go 1.26+；runner 预装版本可能是 1.24，绝不能依赖默认值
+          go-version: '1.26'
+          check-latest: true
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Preflight
+        shell: bash
+        run: |
+          fail=0
+          [ -f "cmd/app/main.go" ]      || { echo "::error file=cmd/app/main.go::应用入口 cmd/app 尚未落地（T9），CI 无法构建"; fail=1; }
+          [ -f "frontend/package.json" ] || { echo "::error file=frontend/package.json::前端工程尚未落地，CI 无法构建"; fail=1; }
+          [ -f "scripts/build.sh" ]      || { echo "::error file=scripts/build.sh::构建脚本缺失"; fail=1; }
+          [ -f "scripts/package.sh" ]    || { echo "::error file=scripts/package.sh::打包脚本缺失"; fail=1; }
+          echo "go:     $(go version)"
+          echo "node:   $(node --version)"
+          echo "target: ${GOOS:-unset}/${GOARCH:-unset}"
+          [ "$fail" -eq 0 ]
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-4-dev libwebkitgtk-6.0-dev libwayland-dev
+          # 快速失败：包名或 pkg-config 目标不对时，这里立刻红，而不是等到链接期
+          pkg-config --modversion gtk4
+          pkg-config --modversion webkitgtk-6.0
+
+      - name: Setup Task
+        # wails3 build 会调用 task；arm64 Windows 上若下载不到可用二进制，
+        # 后续会自动退回 scripts/build.sh，因此这里不让它单独把作业搞红。
+        continue-on-error: true
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Wails CLI
+        shell: bash
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@${{ env.WAILS_VERSION }}
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/wails3" version || true
+
+      - name: Build frontend
+        shell: bash
+        run: |
+          cd frontend
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build
+          test -d dist
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          APP_NAME: ${{ env.APP_NAME }}
+          SKIP_FRONTEND_BUILD: '1'
+        run: |
+          set -euo pipefail
+          if [ -f build/Taskfile.yml ] && command -v task >/dev/null 2>&1; then
+            echo "::notice::使用 wails3 构建（检测到 build/Taskfile.yml 与 task）"
+            if [ "$GOOS" = "darwin" ]; then
+              wails3 package GOOS="$GOOS" GOARCH="$GOARCH"
+            else
+              wails3 build GOOS="$GOOS" GOARCH="$GOARCH"
+            fi
+          else
+            echo "::notice::使用 scripts/build.sh（无 build/Taskfile.yml 或 task 不可用）"
+            bash scripts/build.sh
+            if [ "$GOOS" = "darwin" ]; then
+              bash scripts/build.sh --app
+            fi
+          fi
+          ls -laR bin || true
+
+      - name: Package
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          APP_NAME: ${{ env.APP_NAME }}
+        run: bash scripts/package.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          ls -la
+          sha256sum ./* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            ## 下载
+
+            | 平台 | 文件 |
+            |---|---|
+            | Windows x64 | `hongguo-pc_windows_amd64.zip` |
+            | Windows ARM64 | `hongguo-pc_windows_arm64.zip` |
+            | Linux x64 | `hongguo-pc_linux_amd64.tar.gz` |
+            | Linux ARM64 | `hongguo-pc_linux_arm64.tar.gz` |
+            | macOS Apple Silicon | `hongguo-pc_macos_arm64.zip` |
+            | macOS Intel | `hongguo-pc_macos_amd64.zip` |
+
+            校验：`sha256sum -c SHA256SUMS.txt`（macOS: `shasum -a 256 -c SHA256SUMS.txt`，或 Windows: `certutil -hashfile <file> SHA256` 后手工比对）。
+
+            ## 运行时要求
+
+            - **Windows 10/11**：需要 WebView2 Runtime。Windows 11 通常已自带；缺失时请按
+              [Microsoft WebView2 官方文档](https://learn.microsoft.com/microsoft-edge/webview2/) 安装。
+            - **Linux**：需要 GTK4 + WebKitGTK 6.0 运行时
+              （Debian/Ubuntu: `libgtk-4-1 libwebkitgtk-6.0-4`）。二进制在 Ubuntu 24.04 上构建，
+              更老的发行版未验证。
+            - **macOS**：需要 macOS 11 或更高。**发行包未签名、未公证**，首次打开会被 Gatekeeper
+              拦截（提示无法验证开发者）。这是预期行为，说明见 README。
+            - **所有平台**：ffmpeg 不随包分发，需要用户自备并自行配置路径。
+              仓库不附带、不下载、也不再分发 ffmpeg。
+
+            ## 免责声明
+
+            本项目仅供个人学习与技术研究使用。详情见 README 的「免责声明」一节。
