@@ -35,25 +35,34 @@ export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: P
     [episodes],
   );
 
+  // 空态会提前 return 导致 scroller 卸载/重建：observer 依赖 sorted 存在性
+  // 重挂，否则新 scroller 永远测不到尺寸，viewport 停在初始小值、网格退化单列。
   useEffect(() => {
     const element = scrollerRef.current;
     if (!element) return undefined;
+    const measure = () => {
+      setViewport({ width: element.clientWidth, height: element.clientHeight });
+    };
     const observer = new ResizeObserver((entries) => {
       const rect = entries[0]?.contentRect;
       if (!rect) return;
       setViewport({ width: rect.width, height: rect.height });
     });
     observer.observe(element);
-    setViewport({ width: element.clientWidth, height: element.clientHeight });
+    measure();
     return () => observer.disconnect();
-  }, []);
+  }, [sorted.length > 0]);
 
-  const columns = Math.max(1, Math.floor(viewport.width / minColumnWidth) || 1);
-  const columnWidth = viewport.width > 0 ? viewport.width / columns : minColumnWidth;
-  // 窄容器（播放页抽屉）：列宽不足 150px 时切换为单列紧凑条目，保证
-  // 「第 N 集」+ 时长完整显示，不被缩略图挤压截断。
-  const compact = viewport.width > 0 && columnWidth < 150;
-  const columnWidthAdj = compact ? viewport.width : columnWidth;
+  // 可用宽度要给纵向滚动条留位：clientWidth 不含滚动条，但部分平台
+  // overlay 滚动条会盖住内容右缘，统一预留，避免最后一列贴边截半。
+  const usableWidth = Math.max(0, viewport.width - 14);
+  // 只在总宽放不下两列（<2×minColumnWidth）时才退化单列紧凑条目——
+  // 多列时列数按 minColumnWidth 均分，列窄靠 ellipsis 截断是正常形态；
+  // v0.1.2 的回归就是拿「单列列宽 <150」误判成紧凑模式导致横向溢出。
+  const columns = Math.max(1, Math.floor(usableWidth / minColumnWidth) || 1);
+  const compact = usableWidth > 0 && usableWidth < minColumnWidth * 2;
+  const columnWidth = usableWidth > 0 ? Math.floor(usableWidth / columns) : minColumnWidth;
+  const columnWidthAdj = columnWidth;
   const totalRows = Math.ceil(sorted.length / columns);
   const firstRow = Math.max(0, Math.floor(scrollTop / rowHeight) - overscanRows);
   const lastRow = Math.min(
@@ -97,7 +106,9 @@ export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: P
                 position: 'absolute',
                 left: col * columnWidthAdj,
                 top: row * rowHeight,
-                width: Math.max(0, columnWidthAdj - 8),
+                // 单元格自身只占列宽的一部分，右缘固定留 8px 呼吸空隙；
+                // 配合整数化列宽，最后一列永远不贴容器边。
+                width: Math.max(0, columnWidthAdj - 10),
                 height: rowHeight - 8,
               }}
               disabled={!episode.playable}
@@ -119,7 +130,7 @@ export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: P
                 />
               ) : null}
               <span className="episode-cell__text">
-                <span className="episode-cell__number">第 {episode.number} 集</span>
+                <span className="episode-cell__number">第{episode.number}集</span>
                 <span className="episode-cell__meta">
                   {episode.isNew ? <em className="episode-cell__new">新</em> : null}
                   {formatDuration(episode.durationSec)}

@@ -545,8 +545,9 @@ select:focus {
   scrollbar-width: thin;
 }
 
+/* 详情页选集高度随视口自适应：小窗不溢出、大窗不浪费（320px 下限兜底）。 */
 .episode-grid--detail {
-  height: 360px;
+  height: clamp(320px, 48vh, 560px);
 }
 
 .episode-grid__empty {
@@ -561,8 +562,8 @@ select:focus {
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 8px;
-  padding: 0 8px;
+  gap: 6px;
+  padding: 0 6px;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
@@ -573,8 +574,8 @@ select:focus {
 
 .episode-cell__thumb {
   flex: none;
-  width: 40px;
-  height: 44px;
+  width: 34px;
+  height: 40px;
   border-radius: var(--r-sm);
   object-fit: cover;
   background: var(--soft);
