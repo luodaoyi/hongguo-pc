@@ -53,6 +53,14 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   const [quotaExhausted, setQuotaExhausted] = useState(false);
   const [quota, setQuota] = useState<QuotaChangedPayload | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(true);
+  // 播放速度：会话内记忆，换集/连播交接在 loadedmetadata 里恢复（video 元素
+  // 随 src 重建会重置 playbackRate）。档位最高 3 倍。
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const playbackRateRef = useRef(1);
+  // 后端可信时长（PrepareResult.durationSec，来自选集目录）：渐进 fMP4 的
+  // 初始 moov 里时长是估计值（常偏小，写完才准），显示与 seek 上限以它校正。
+  const [trustedDuration, setTrustedDuration] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
   // 自动下一集：唯一真值在 Go 设置项 autoNextEpisode（Settings.Get/Set），
   // localStorage 那份已删除（首辅裁断：两个开关必须合成一个）。
   const [autoNext, setAutoNext] = useState(true);
@@ -117,6 +125,7 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
       setPhase('ready');
       const resume = typeof handoff.resumeSec === 'number' ? handoff.resumeSec : 0;
       if (pendingSeekRef.current === 0 && resume > 0) pendingSeekRef.current = resume;
+      setTrustedDuration(typeof handoff.durationSec === 'number' ? handoff.durationSec : 0);
       return;
     }
     try {
@@ -130,6 +139,7 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
       // 后端给的续播点：本次没有显式 ?t= 时采用（§6.5 续播）。
       const resume = typeof result.resumeSec === 'number' ? result.resumeSec : 0;
       if (pendingSeekRef.current === 0 && resume > 0) pendingSeekRef.current = resume;
+      setTrustedDuration(typeof result.durationSec === 'number' ? result.durationSec : 0);
     } catch (err) {
       setPhase('error');
       setError({
@@ -204,11 +214,13 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
     (delta: number) => {
       const video = videoRef.current;
       if (!video) return;
-      const duration = Number.isFinite(video.duration) ? video.duration : video.currentTime + Math.abs(delta);
+      // 渐进 fMP4 初始 moov 时长偏小：seek 上限取「元数据与后端可信时长」的较大者。
+      const meta = Number.isFinite(video.duration) ? video.duration : 0;
+      const duration = Math.max(meta, trustedDuration, video.currentTime + Math.abs(delta));
       video.currentTime = Math.min(Math.max(0, video.currentTime + delta), duration);
       reportPosition(true);
     },
-    [reportPosition],
+    [reportPosition, trustedDuration],
   );
 
   const toggleFullscreen = useCallback(() => {
@@ -510,6 +522,26 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
           </select>
         </label>
 
+        <label className="player-topbar__quality">
+          倍速
+          <select
+            value={playbackRate}
+            onChange={(event) => {
+              const rate = Number(event.target.value);
+              setPlaybackRate(rate);
+              playbackRateRef.current = rate;
+              const video = videoRef.current;
+              if (video) video.playbackRate = rate;
+            }}
+          >
+            {[0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3].map((rate) => (
+              <option key={rate} value={rate}>
+                {rate}x
+              </option>
+            ))}
+          </select>
+        </label>
+
         <label className="toggle">
           <input type="checkbox" checked={autoNext} onChange={(event) => changeAutoNext(event.target.checked)} />
           自动下一集
@@ -563,14 +595,34 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
             onError={handleVideoError}
             onLoadedMetadata={() => {
               const video = videoRef.current;
+              if (!video) return;
+              // 换集/连播交接会重建 video 元素，playbackRate 被浏览器重置为 1：
+              // 元数据就绪后恢复会话内选择的速度，实现「设 2 倍就一直 2 倍」。
+              video.playbackRate = playbackRateRef.current;
               const target = pendingSeekRef.current;
-              if (!video || !target || target <= 0) return;
-              const duration = Number.isFinite(video.duration) ? video.duration : target;
+              if (!target || target <= 0) return;
+              // seek 上限取元数据与后端可信时长的较大者（渐进 moov 偏小）。
+              const duration = Math.max(
+                Number.isFinite(video.duration) ? video.duration : 0,
+                trustedDuration,
+                target,
+              );
               video.currentTime = Math.min(target, duration);
               pendingSeekRef.current = 0;
             }}
+            onDurationChange={() => {
+              // 渐进 fMP4 的初始 moov 时长是估计值（常偏小）；后端
+              // durationSec 来自选集目录，是可信值——两者取更大者显示。
+              const video = videoRef.current;
+              if (!video) return;
+              const meta = Number.isFinite(video.duration) ? video.duration : 0;
+              setVideoDuration(Math.max(meta, trustedDuration));
+            }}
           />
           {phase === 'resolving' ? <div className="player-overlay">正在解析播放地址…</div> : null}
+          {videoDuration > 0 && phase === 'ready' ? (
+            <div className="player-duration-badge">时长 {formatDuration(videoDuration)}</div>
+          ) : null}
           {preparing ? (
             <div className="player-overlay">
               解密中…{preparing.stage ? `（${preparing.stage}）` : ''}

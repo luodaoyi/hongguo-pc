@@ -927,6 +927,20 @@ select:focus {
   pointer-events: none;
 }
 
+/* 可信时长角标：渐进 fMP4 的原生 controls 时长在写完前偏小，角标始终显示
+   后端选集目录里的真实时长。放右上角，不挡控制条。 */
+.player-duration-badge {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  padding: 3px 10px;
+  border-radius: var(--r-sm);
+  background: rgb(16 18 20 / 0.72);
+  color: #e8eaed;
+  font-size: 12px;
+  pointer-events: none;
+}
+
 .player-drawer {
   flex: 0 0 280px;
   width: 280px;
