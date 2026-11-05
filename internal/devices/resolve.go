@@ -51,7 +51,15 @@ func (p *Pool) ResolvePlayback(ctx context.Context, episodeID string) (*sdkmodel
 		return pb, nil
 	}
 
-	for attempt := 1; attempt <= p.maxPerResolution; attempt++ {
+	for attempt := 1; ; attempt++ {
+		// Unlimited 模式：尝试次数不设上限，烧一台造一台，直到成功或 ctx 取消；
+		// 上限只约束单次解析内对存量槽的重试（防对冷却中的池空转）。
+		if attempt > p.maxPerResolution && !p.unlimited {
+			return nil, ErrQuotaExhausted
+		}
+		if attempt > 1 {
+			p.logf("devices: playback attempt %d for %s", attempt, episodeID)
+		}
 		s, err := p.Acquire(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -62,7 +70,8 @@ func (p *Pool) ResolvePlayback(ctx context.Context, episodeID string) (*sdkmodel
 		pb, callErr := p.resolveOn(ctx, s, episodeID)
 		switch {
 		case errors.Is(callErr, sdkx.ErrAnonymousLimited):
-			// 该设备额度用尽：记账后换下一台（方案 §4.1）。
+			// 该设备额度用尽：记账后换下一台；Unlimited 模式下 Acquire 会
+			// 自动注册新设备（方案 §4.1 的无限版）。
 			p.MarkExhausted(s)
 			continue
 
@@ -70,6 +79,9 @@ func (p *Pool) ResolvePlayback(ctx context.Context, episodeID string) (*sdkmodel
 			// 设备被拒：换档案 + 冷却，换下一台（方案 §4.4 / F17）。
 			if resetErr := s.client.ResetDevice(ctx); resetErr != nil {
 				p.MarkCooling(s, p.coolDown)
+				if p.unlimited {
+					continue // 换档失败也继续造新设备
+				}
 				return nil, fmt.Errorf("devices: reset device for slot %s: %w", s.ID, resetErr)
 			}
 			p.MarkCooling(s, p.coolDown)
@@ -80,7 +92,7 @@ func (p *Pool) ResolvePlayback(ctx context.Context, episodeID string) (*sdkmodel
 			if wait > maxInlineWait {
 				return nil, ErrRateLimitedLong
 			}
-			p.logf("devices: rate limited, waiting %s before retry %d/%d", wait, attempt, p.maxPerResolution)
+			p.logf("devices: rate limited, waiting %s before retry %d", wait, attempt)
 			if sleepErr := sleepContext(ctx, wait); sleepErr != nil {
 				return nil, sleepErr
 			}
@@ -103,7 +115,6 @@ func (p *Pool) ResolvePlayback(ctx context.Context, episodeID string) (*sdkmodel
 			return pb, callErr
 		}
 	}
-	return nil, ErrQuotaExhausted
 }
 
 // Do 在池内取一个槽执行一次目录类调用（0 额度，方案 §4.5）。只用 healthy 槽。

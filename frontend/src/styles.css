@@ -587,6 +587,7 @@ select:focus {
   justify-content: center;
   gap: 1px;
   min-width: 0;
+  flex: 1;
 }
 
 .episode-cell:hover:not(:disabled) {
@@ -608,6 +609,18 @@ select:focus {
 .episode-cell__number {
   font-size: 13px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 紧凑模式（窄容器单列）：缩略图缩小，文字区占满剩余宽度，保证完整显示。 */
+.episode-grid--compact .episode-cell__thumb {
+  width: 36px;
+  height: 40px;
+}
+
+.episode-grid--compact .episode-cell {
+  gap: 10px;
 }
 
 .episode-cell__meta {

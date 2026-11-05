@@ -11,6 +11,7 @@ package library
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -263,6 +264,14 @@ func (s *Service) refresh(ctx context.Context, seriesID string, force bool) (add
 		s.logf("library: refresh %s returned no episodes, keeping cached rows", seriesID)
 		return 0, 0, 0, nil
 	}
+	// 上游 v.List 是线序、不保证按集号递增（多季/换挡剧实测会乱），
+	// 入库前按 number 升序稳定排序，保证 diff 与展示顺序一致。
+	sort.SliceStable(fresh, func(i, j int) bool {
+		if fresh[i].Number != fresh[j].Number {
+			return fresh[i].Number < fresh[j].Number
+		}
+		return fresh[i].ID < fresh[j].ID
+	})
 	diff, err := s.st.ReplaceEpisodes(ctx, seriesID, fresh)
 	if err != nil {
 		return 0, 0, 0, err

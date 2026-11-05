@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Episode } from '../types';
 import { formatDuration } from '../format';
 
@@ -13,9 +13,10 @@ interface Props {
 /**
  * 剧集网格（窗口化渲染，方案 §7.1 与任务书「>120 条窗口化」）。
  *
- * 只挂载滚动视口附近的若干行，DOM 数量与总集数无关；宽度不足一列时退化为两列。
+ * 只挂载滚动视口附近的若干行，DOM 数量与总集数无关；宽度不足时退化单列。
  * 高度与宽度都靠 ResizeObserver 实测，父容器决定可视区大小（详情页固定高度、
- * 播放页抽屉撑满右侧）。
+ * 播放页抽屉撑满右侧）。列表展示前按 number 升序稳定排序（后端已排，这里兜底
+ * 防御缓存/事件迟到等乱序来源）。
  */
 export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: Props) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
@@ -25,6 +26,14 @@ export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: P
   const rowHeight = 64;
   const minColumnWidth = 108;
   const overscanRows = 2;
+
+  const sorted = useMemo(
+    () =>
+      [...episodes].sort((a, b) =>
+        a.number !== b.number ? a.number - b.number : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+      ),
+    [episodes],
+  );
 
   useEffect(() => {
     const element = scrollerRef.current;
@@ -39,9 +48,13 @@ export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: P
     return () => observer.disconnect();
   }, []);
 
-  const columns = Math.max(2, Math.floor(viewport.width / minColumnWidth) || 2);
+  const columns = Math.max(1, Math.floor(viewport.width / minColumnWidth) || 1);
   const columnWidth = viewport.width > 0 ? viewport.width / columns : minColumnWidth;
-  const totalRows = Math.ceil(episodes.length / columns);
+  // 窄容器（播放页抽屉）：列宽不足 150px 时切换为单列紧凑条目，保证
+  // 「第 N 集」+ 时长完整显示，不被缩略图挤压截断。
+  const compact = viewport.width > 0 && columnWidth < 150;
+  const columnWidthAdj = compact ? viewport.width : columnWidth;
+  const totalRows = Math.ceil(sorted.length / columns);
   const firstRow = Math.max(0, Math.floor(scrollTop / rowHeight) - overscanRows);
   const lastRow = Math.min(
     totalRows,
@@ -52,19 +65,19 @@ export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: P
   for (let row = firstRow; row < lastRow; row += 1) {
     for (let col = 0; col < columns; col += 1) {
       const index = row * columns + col;
-      const episode = episodes[index];
+      const episode = sorted[index];
       if (!episode) break;
       visible.push({ episode, index });
     }
   }
 
-  if (episodes.length === 0) {
+  if (sorted.length === 0) {
     return <div className="episode-grid__empty">{emptyText ?? '暂无剧集'}</div>;
   }
 
   return (
     <div
-      className="episode-grid"
+      className={`episode-grid${compact ? ' episode-grid--compact' : ''}`}
       ref={scrollerRef}
       onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
     >
@@ -82,13 +95,13 @@ export function EpisodeGrid({ episodes, currentEpisodeId, onPick, emptyText }: P
               }`}
               style={{
                 position: 'absolute',
-                left: col * columnWidth,
+                left: col * columnWidthAdj,
                 top: row * rowHeight,
-                width: Math.max(0, columnWidth - 8),
+                width: Math.max(0, columnWidthAdj - 8),
                 height: rowHeight - 8,
               }}
               disabled={!episode.playable}
-              title={episode.playable ? episode.title ?? '' : '该集不可播放'}
+              title={episode.playable ? episode.title ?? `第 ${episode.number} 集` : '该集不可播放'}
               onClick={(event) => {
                 event.currentTarget.blur();
                 onPick(episode);

@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/luodaoyi/hongguo-pc/internal/sdkx"
 	"github.com/luodaoyi/hongguo-pc/internal/store"
@@ -63,5 +64,45 @@ func TestCappedPoolNoGrow(t *testing.T) {
 	p.mu.Unlock()
 	if _, err := p.Acquire(context.Background()); err != ErrQuotaExhausted {
 		t.Fatalf("未开启 Unlimited 时应报额度耗尽，实际 %v", err)
+	}
+}
+
+func TestUnlimitedGrowWhenAllExhausted(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	const n = 16
+	p, err := NewPool(Config{
+		Dir: dir, Store: st, Slots: n, Unlimited: true,
+		NewClient: func(profilePath string, onRejected func(error)) (*sdkx.Client, error) {
+			return &sdkx.Client{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 全部槽置为 exhausted 且带真实 lastUsed（复现「看剧一天后全烧完」的状态）。
+	p.mu.Lock()
+	now := p.now()
+	for _, s := range p.slots {
+		s.state = "exhausted"
+		s.lastUsed = now.Add(-time.Hour)
+		s.quotaUsed = 1
+		s.quotaDay = 20261106
+	}
+	p.mu.Unlock()
+	s, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("全耗尽 + Unlimited 应自动扩槽，实际 err=%v", err)
+	}
+	if s.ID != "d017" {
+		t.Fatalf("期望新槽 d017，实际 %s", s.ID)
+	}
+	p.Release(s)
+	if got := len(p.Status().Slots); got != n+1 {
+		t.Fatalf("期望池大小 %d，实际 %d", n+1, got)
 	}
 }
