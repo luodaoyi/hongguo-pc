@@ -83,6 +83,32 @@ export function DiscoverPage() {
     return () => observer.disconnect();
   }, [loadMore]);
 
+  // 空列补拉：最短列分发下若某列明显缺卡（比最少列少 ≥2 张，即页面下缘
+  // 出现成片空白），自动补一页。触底（hasMore=false）时也允许：重置回卷
+  // 计数再拉一次——推荐流轮换会给出新内容；仍拉不到新卡则下次不再触发
+  // （items 不变 → effect 不重跑），不会死循环。
+  useEffect(() => {
+    if (loading || items.length === 0 || items.length < columns * 2) return;
+    const counts = new Array(columns).fill(0);
+    for (let i = 0; i < items.length; i += 1) {
+      let target = 0;
+      for (let c = 1; c < columns; c += 1) {
+        if (counts[c] < counts[target]) target = c;
+      }
+      counts[target] += 1;
+    }
+    const min = Math.min(...counts);
+    const max = Math.max(...counts);
+    if (max - min < 2) return;
+    if (!hasMore) {
+      if (emptyWrapsRef.current >= 2) return;
+      emptyWrapsRef.current += 1;
+      hasMoreRef.current = true;
+      setHasMore(true);
+    }
+    void loadMore();
+  }, [items, columns, loading, hasMore, loadMore]);
+
   const retry = () => {
     hasMoreRef.current = true;
     setHasMore(true);
@@ -125,19 +151,33 @@ export function DiscoverPage() {
       ) : null}
 
       <div className="card-grid" ref={gridRef}>
-        {Array.from({ length: columns }, (_, ci) => (
-          <div className="card-col" key={ci}>
-            {items
-              .filter((_, i) => i % columns === ci)
-              .map((series) => (
+        {/* 最短列优先分发：比取模均分更平衡，条目数不是列数整数倍时
+            多出的卡片平摊到各列，不会出现右侧整列空白。 */}
+        {(() => {
+          const heights = new Array(columns).fill(0);
+          const cols: Series[][] = Array.from({ length: columns }, () => []);
+          for (const series of items) {
+            let target = 0;
+            for (let c = 1; c < columns; c += 1) {
+              if (heights[c] < heights[target]) target = c;
+            }
+            cols[target].push(series);
+            // 高度近似：封面按列宽 4/3 比例 + 文本三行，卡片高度差异主要
+            // 来自简介有无，用「有无简介」分档即可保证分发表平衡。
+            heights[target] += series.description ? 110 : 92;
+          }
+          return cols.map((col, ci) => (
+            <div className="card-col" key={ci}>
+              {col.map((series) => (
                 <SeriesCard
                   key={series.id}
                   series={series}
                   onClick={(picked) => navigate(`/series/${picked.id}`)}
                 />
               ))}
-          </div>
-        ))}
+            </div>
+          ));
+        })()}
       </div>
 
       {items.length === 0 && !loading && !error ? (
