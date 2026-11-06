@@ -33,7 +33,10 @@ export function SeriesCard({ series, onClick }: Props) {
           {series.description}
         </div>
       ) : null}
-      <div className="series-card__meta">{statusText(series.status)}</div>
+      {/* 状态拿不到（搜索接口不回）时整行隐藏，不渲染「状态未知」占位。 */}
+      {statusText(series.status) !== '' ? (
+        <div className="series-card__meta">{statusText(series.status)}</div>
+      ) : null}
     </button>
   );
 }

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as api from '../api';
 import { errorMessage } from '../format';
 import { navigate } from '../router';
@@ -14,6 +14,22 @@ export function SearchPage() {
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 瀑布流列数随容器宽度自适应（与书城同一套：220px 一列，2-8 列）。
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const [columns, setColumns] = useState(4);
+
+  useEffect(() => {
+    const el = gridRef.current;
+    if (!el) return undefined;
+    const update = () => {
+      const k = Math.max(2, Math.min(8, Math.floor(el.clientWidth / 220) || 2));
+      setColumns((prev) => (prev === k ? prev : k));
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   const run = async (text: string, nextCursor: string, append: boolean) => {
     setLoading(true);
@@ -64,14 +80,32 @@ export function SearchPage() {
 
       {error ? <div className="notice notice--error">搜索失败：{error}</div> : null}
 
-      <div className="card-grid">
-        {items.map((series) => (
-          <SeriesCard
-            key={series.id}
-            series={series}
-            onClick={(picked) => navigate(`/series/${picked.id}`)}
-          />
-        ))}
+      <div className="card-grid" ref={gridRef}>
+        {/* 与书城同款最短列优先分发：直接平铺进 flex 容器会没有宽度约束，
+            卡片被压成窄条（v0.1.9 实测搜索页塌陷）。高度估算与书城一致。 */}
+        {(() => {
+          const heights = new Array(columns).fill(0);
+          const cols: Series[][] = Array.from({ length: columns }, () => []);
+          for (const series of items) {
+            let target = 0;
+            for (let c = 1; c < columns; c += 1) {
+              if (heights[c] < heights[target]) target = c;
+            }
+            cols[target].push(series);
+            heights[target] += series.description ? 110 : 92;
+          }
+          return cols.map((col, ci) => (
+            <div className="card-col" key={ci}>
+              {col.map((series) => (
+                <SeriesCard
+                  key={series.id}
+                  series={series}
+                  onClick={(picked) => navigate(`/series/${picked.id}`)}
+                />
+              ))}
+            </div>
+          ));
+        })()}
       </div>
 
       {submitted !== '' && items.length === 0 && !loading && !error ? (

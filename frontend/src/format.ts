@@ -11,7 +11,9 @@ export function statusText(status: string): string {
     case 'stopped':
       return '已停更';
     default:
-      return '状态未知';
+      // 搜索接口不回状态（上游模型 SeriesSummary 无此字段），空串让卡片
+      // 隐藏整行——满屏「状态未知」没有信息量（v0.1.9 实测）。
+      return '';
   }
 }
 
