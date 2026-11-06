@@ -42,16 +42,20 @@ type Options struct {
 	// WebView2 解不了，需经 localsrv 转 JPEG；见 localsrv.ImageURL）。
 	// nil = 原样返回。store 里落库的仍是原始 URL，改写只发生在读出时。
 	CoverProxy func(url string) string
+	// CoverProxyIsLocal 可选：判断 url 是否为 CoverProxy 生成的本会话代理
+	// 地址。proxyCover 用它识别脏缓存里的死代理地址（上一会话 token 已失效）。
+	CoverProxyIsLocal func(url string) bool
 }
 
 // Service 是目录层服务。并发安全。
 type Service struct {
-	pool       *devices.Pool
-	st         store.Store
-	now        func() time.Time
-	logf       func(string, ...any)
-	onRefresh  func(seriesID string, added, updated, removed int)
-	coverProxy func(url string) string
+	pool         *devices.Pool
+	st           store.Store
+	now          func() time.Time
+	logf         func(string, ...any)
+	onRefresh    func(seriesID string, added, updated, removed int)
+	coverProxy   func(url string) string
+	coverIsLocal func(url string) bool
 
 	mu sync.Mutex
 	// lastRefresh 记每部剧的上次刷新时间与结果，用于 30 秒去抖（方案 §7.4）：
@@ -83,23 +87,32 @@ func New(opts Options) (*Service, error) {
 		logf = func(string, ...any) {}
 	}
 	return &Service{
-		pool:        opts.Pool,
-		st:          opts.Store,
-		now:         now,
-		logf:        logf,
-		onRefresh:   opts.OnEpisodesRefreshed,
-		coverProxy:  opts.CoverProxy,
-		lastRefresh: make(map[string]time.Time, 16),
-		lastDiff:    make(map[string][3]int, 16),
-		epSeries:    make(map[string]string, 256),
+		pool:         opts.Pool,
+		st:           opts.Store,
+		now:          now,
+		logf:         logf,
+		onRefresh:    opts.OnEpisodesRefreshed,
+		coverProxy:   opts.CoverProxy,
+		coverIsLocal: opts.CoverProxyIsLocal,
+		lastRefresh:  make(map[string]time.Time, 16),
+		lastDiff:     make(map[string][3]int, 16),
+		epSeries:     make(map[string]string, 256),
 	}, nil
 }
 
 // proxyCover 统一改写封面地址：nil 时原样返回。store 落库原始 URL，
 // 改写只发生在 DTO 读出时，签名失效后重拉数据即可拿到新签名。
+// 输入若是本地代理地址（脏缓存里上一会话的死地址），按无封面处理：
+// token 已换代，改写不出有效地址，返回空串让界面走降级兜底。
 func (s *Service) proxyCover(u string) string {
+	if u == "" {
+		return u
+	}
 	if s.coverProxy == nil {
 		return u
+	}
+	if s.coverIsLocal != nil && s.coverIsLocal(u) {
+		return ""
 	}
 	return s.coverProxy(u)
 }
@@ -178,11 +191,13 @@ func (s *Service) GetSeries(ctx context.Context, seriesID string) (model.SeriesD
 	if err != nil {
 		return model.SeriesDTO{}, err
 	}
-	dto.CoverURL = s.proxyCover(dto.CoverURL)
+	// 先用原始 URL 落库，再改写给前端：顺序反了会把带会话 token 的本地代理
+	// 地址写进 store，重启后 token 换代、缓存封面全部 403（v0.1.6 实测事故）。
 	if err := s.st.UpsertSeries(ctx, dto); err != nil {
 		// 缓存失败不影响展示，只记日志。
 		s.logf("library: cache series %s: %v", seriesID, err)
 	}
+	dto.CoverURL = s.proxyCover(dto.CoverURL)
 	return dto, nil
 }
 

@@ -172,6 +172,7 @@ func run() error {
 		Logf:                logf,
 		OnEpisodesRefreshed: bindings.EmitEpisodeUpdated,
 		CoverProxy:          srv.ImageURL,
+		CoverProxyIsLocal:   srv.IsLocalProxyImg,
 	})
 	if err != nil {
 		return err

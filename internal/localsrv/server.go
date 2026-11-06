@@ -182,6 +182,26 @@ func (s *Server) ImageURL(remote string) string {
 	return "http://" + addr + "/img?" + q.Encode()
 }
 
+// IsLocalProxyImg 判断 url 是否为本会话 /img 代理地址（同 host+port+token）。
+// library 层在改写封面与落库前用它挡两件事：脏缓存里上一会话的死代理地址
+// （token 已换，直接当无封面处理）、以及防止把本会话代理 URL 写回 store。
+func (s *Server) IsLocalProxyImg(remote string) bool {
+	if remote == "" {
+		return false
+	}
+	s.mu.RLock()
+	closed, addr, token := s.closed, s.ln.Addr().String(), s.token
+	s.mu.RUnlock()
+	if closed || token == "" {
+		return false
+	}
+	parsed, err := url.Parse(remote)
+	if err != nil {
+		return false
+	}
+	return parsed.Host == addr && parsed.Path == "/img" && parsed.Query().Get("t") == token
+}
+
 // serveImage 是 HEIC 封面的本地代理：带 token 校验 + 图床白名单，命中磁盘缓存
 // 直接回；否则回源下载、按嗅探结果转码 JPEG（ffmpeg 缺失/失败回退原始字节）。
 // 错误分支只给状态码，不回显原因，与 /v/ 的纪律一致。
