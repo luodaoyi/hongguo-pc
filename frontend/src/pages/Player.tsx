@@ -61,6 +61,10 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   // 初始 moov 里时长是估计值（常偏小，写完才准），显示与 seek 上限以它校正。
   const [trustedDuration, setTrustedDuration] = useState(0);
   const [videoDuration, setVideoDuration] = useState(0);
+  // 自绘控制条状态：原生 controls 的时长显示取 video.duration（moov 估计值）
+  // 且 Chromium 锁定后不再更新，管不了——去掉 controls，自己画。
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
   // 自动下一集：唯一真值在 Go 设置项 autoNextEpisode（Settings.Get/Set），
   // localStorage 那份已删除（首辅裁断：两个开关必须合成一个）。
   const [autoNext, setAutoNext] = useState(true);
@@ -116,6 +120,10 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
     setPhase('resolving');
     setError(null);
     setPreparing(null);
+    // 换集重置自绘控制条：video 元素随 src 重建，旧时间/时长不能带过去。
+    setCurrentTime(0);
+    setVideoDuration(0);
+    setPlaying(false);
     // 连播交接：Go 侧 Ended 已经解好这一集，直接用它的源，不再重复 Prepare。
     const handoff = preparedHandoff.get(targetEpisodeId);
     if (handoff?.source?.url) {
@@ -208,6 +216,30 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
     } else {
       video.pause();
     }
+  }, []);
+
+  /** 展示/seek 共用的有效时长：元数据与后端可信时长取大（moov 估计值偏小）。 */
+  const effectiveDuration = Math.max(videoDuration, trustedDuration);
+
+  /** 点进度条跳转到指定秒；上限即有效时长。 */
+  const seekTo = useCallback(
+    (seconds: number) => {
+      const video = videoRef.current;
+      if (!video || !Number.isFinite(seconds) || seconds < 0) return;
+      const duration = Math.max(
+        Number.isFinite(video.duration) ? video.duration : 0,
+        trustedDuration,
+      );
+      if (duration <= 0) return;
+      video.currentTime = Math.min(seconds, duration);
+      reportPosition(true);
+    },
+    [reportPosition, trustedDuration],
+  );
+
+  const toggleMute = useCallback(() => {
+    const video = videoRef.current;
+    if (video) video.muted = !video.muted;
   }, []);
 
   const seekBy = useCallback(
@@ -586,11 +618,24 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
           <video
             ref={videoRef}
             className="player-video"
-            controls
             playsInline
             preload="metadata"
-            onTimeUpdate={() => reportPosition(false)}
-            onPause={() => reportPosition(true)}
+            onTimeUpdate={() => {
+              reportPosition(false);
+              // 动态解析时长：渐进 fMP4 每次元数据修正都可能推大 duration，
+              // timeupdate 里持续取 max，配合后端可信时长兜底估计值偏小。
+              const video = videoRef.current;
+              if (!video) return;
+              setCurrentTime(video.currentTime);
+              const meta = Number.isFinite(video.duration) ? video.duration : 0;
+              const next = Math.max(meta, trustedDuration);
+              setVideoDuration((prev) => (next > prev ? next : prev));
+            }}
+            onPlay={() => setPlaying(true)}
+            onPause={() => {
+              setPlaying(false);
+              reportPosition(true);
+            }}
             onEnded={handleEnded}
             onError={handleVideoError}
             onLoadedMetadata={() => {
@@ -612,11 +657,12 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
             }}
             onDurationChange={() => {
               // 渐进 fMP4 的初始 moov 时长是估计值（常偏小）；后端
-              // durationSec 来自选集目录，是可信值——两者取更大者显示。
+              // durationSec 来自选集目录，是可信值——只增不减取更大者，
+              // 换集归零由 prepareNow 负责。
               const video = videoRef.current;
               if (!video) return;
               const meta = Number.isFinite(video.duration) ? video.duration : 0;
-              setVideoDuration(Math.max(meta, trustedDuration));
+              setVideoDuration((prev) => Math.max(prev, meta, trustedDuration));
             }}
           />
           {phase === 'resolving' ? <div className="player-overlay">正在解析播放地址…</div> : null}
@@ -626,6 +672,47 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
           {preparing ? (
             <div className="player-overlay">
               解密中…{preparing.stage ? `（${preparing.stage}）` : ''}
+            </div>
+          ) : null}
+          {phase === 'ready' ? (
+            <div className="player-controls">
+              <button
+                className="player-controls__btn"
+                type="button"
+                onClick={togglePlay}
+                title="播放/暂停"
+              >
+                {playing ? '⏸' : '▶'}
+              </button>
+              <span className="player-controls__time">
+                {formatDuration(currentTime)} / {formatDuration(effectiveDuration)}
+              </span>
+              <input
+                className="player-controls__bar"
+                type="range"
+                min={0}
+                max={effectiveDuration > 0 ? effectiveDuration : 1}
+                step={0.1}
+                value={Math.min(currentTime, effectiveDuration || currentTime)}
+                onChange={(event) => seekTo(Number(event.target.value))}
+                aria-label="播放进度"
+              />
+              <button
+                className="player-controls__btn"
+                type="button"
+                onClick={toggleMute}
+                title="静音"
+              >
+                🔊
+              </button>
+              <button
+                className="player-controls__btn"
+                type="button"
+                onClick={toggleFullscreen}
+                title="全屏"
+              >
+                {isFullscreen ? '⤡' : '⛶'}
+              </button>
             </div>
           ) : null}
         </div>

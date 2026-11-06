@@ -941,6 +941,52 @@ select:focus {
   pointer-events: none;
 }
 
+/* 自绘控制条：原生 controls 的时长取 video.duration（fMP4 moov 估计值）
+   且 Chromium 锁定后不更新，管不了——去 controls 自己画，时长用
+   max(元数据, 后端可信时长) 动态刷新。 */
+.player-controls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: linear-gradient(transparent, rgb(10 11 13 / 0.85));
+}
+
+.player-controls__btn {
+  flex: 0 0 auto;
+  border: 0;
+  background: none;
+  color: #e8eaed;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+.player-controls__btn:hover {
+  color: #ffffff;
+}
+
+.player-controls__time {
+  flex: 0 0 auto;
+  color: #e8eaed;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.player-controls__bar {
+  flex: 1;
+  min-width: 0;
+  accent-color: #e0533d;
+  height: 4px;
+  cursor: pointer;
+}
+
 .player-drawer {
   flex: 0 0 280px;
   width: 280px;
