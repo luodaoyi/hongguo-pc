@@ -30,6 +30,7 @@ import (
 	"github.com/luodaoyi/hongguo-pc/internal/localsrv"
 	"github.com/luodaoyi/hongguo-pc/internal/media"
 	"github.com/luodaoyi/hongguo-pc/internal/player"
+	"github.com/luodaoyi/hongguo-pc/internal/singleinstance"
 	"github.com/luodaoyi/hongguo-pc/internal/store"
 )
 
@@ -63,6 +64,14 @@ func reportStartupError(err error) {
 func run() error {
 	logger := log.New(os.Stderr, "hongguo-pc: ", log.LstdFlags)
 	logf := func(format string, args ...any) { logger.Printf(format, args...) }
+
+	// 0. 单实例：先杀同名旧实例（含异常退出残留），再抢互斥量裁决唯一性。
+	// 旧实例持有 SQLite 与设备池，双开必然互相踩写，必须先清场。
+	release, err := singleinstance.Acquire("hongguo-pc")
+	if err != nil {
+		return fmt.Errorf("单实例检查失败: %w", err)
+	}
+	defer release()
 
 	// 1. 数据目录：%LOCALAPPDATA%\hongguo-pc（方案 §13.1）。
 	dataDir, err := resolveDataDir()
