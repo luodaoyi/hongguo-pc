@@ -83,23 +83,27 @@ export function DiscoverPage() {
     return () => observer.disconnect();
   }, [loadMore]);
 
-  // 空列补拉：最短列分发下若某列明显缺卡（比最少列少 ≥2 张，即页面下缘
-  // 出现成片空白），自动补一页。触底（hasMore=false）时也允许：重置回卷
-  // 计数再拉一次——推荐流轮换会给出新内容；仍拉不到新卡则下次不再触发
-  // （items 不变 → effect 不重跑），不会死循环。
+  // 空列补拉：最短列分发下若视觉失衡（最高列与最矮列的高度差超过一张
+  // 卡，页面下缘即出现成片空白）就自动补一页。判据用高度差而非张数差：
+  // 张数相同的列因简介有无，视觉高度仍可能差出一张卡（v0.1.8 实测空格）。
+  // items 少于「每列至少一张」也补拉——页矮无滚动条时触底 observer 永远
+  // 不触发，没有这个门小批量场景会死锁。触底（hasMore=false）时也允许：
+  // 重置回卷计数再拉一次——推荐流轮换会给出新内容；仍拉不到新卡则下次
+  // 不再触发（items 不变 → effect 不重跑），不会死循环。
   useEffect(() => {
-    if (loading || items.length === 0 || items.length < columns * 2) return;
-    const counts = new Array(columns).fill(0);
-    for (let i = 0; i < items.length; i += 1) {
+    if (loading || items.length === 0) return;
+    // 与渲染层同一套高度估算，保证判据与视觉一致。
+    const heights = new Array(columns).fill(0);
+    for (const series of items) {
       let target = 0;
       for (let c = 1; c < columns; c += 1) {
-        if (counts[c] < counts[target]) target = c;
+        if (heights[c] < heights[target]) target = c;
       }
-      counts[target] += 1;
+      heights[target] += series.description ? 110 : 92;
     }
-    const min = Math.min(...counts);
-    const max = Math.max(...counts);
-    if (max - min < 2) return;
+    const min = Math.min(...heights);
+    const max = Math.max(...heights);
+    if (max - min < 110) return;
     if (!hasMore) {
       if (emptyWrapsRef.current >= 2) return;
       emptyWrapsRef.current += 1;
