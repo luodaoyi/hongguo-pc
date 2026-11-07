@@ -149,6 +149,27 @@ jobs:
           fi
           ls -laR bin || true
 
+      # mpv 内核分发（仅 windows/amd64；arm64 无官方 libmpv 构建，应用自动
+      # 回退 <video>）。dll 放进打包目录随 zip 分发——libmpv v0.42 shinchiro
+      # 构建（下载失败不阻断发版：应用探测不到 dll 自动走回退路径）。
+      - name: Fetch libmpv (windows amd64)
+        if: matrix.goos == 'windows' && matrix.goarch == 'amd64'
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261107/mpv-dev-x86_64-20261107-git-9028187538.7z'
+          $archive = Join-Path $env:RUNNER_TEMP 'mpv-dev.7z'
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRedirection 10
+            $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+            if (-not (Test-Path $sevenZip)) { throw '7z.exe not found on runner' }
+            & $sevenZip e $archive -obin 'libmpv-2.dll' -y
+            if (Test-Path 'bin/libmpv-2.dll') {
+              Write-Host "::notice::libmpv-2.dll 已就位（$((Get-Item 'bin/libmpv-2.dll').Length / 1MB -as [int]) MB）"
+            } else { throw 'libmpv-2.dll not extracted' }
+          } catch {
+            Write-Host "::warning::libmpv 下载失败，本包回退 <video> 播放：$($_.Exception.Message)"
+          }
+
       - name: Package
         shell: bash
         env:

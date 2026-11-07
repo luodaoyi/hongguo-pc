@@ -15,6 +15,7 @@ import {
   History as HistoryBinding,
   Library as LibraryBinding,
   Media as MediaBinding,
+  MPV as MPVBinding,
   Player as PlayerBinding,
   Settings as SettingsBinding,
 } from '../bindings/github.com/luodaoyi/hongguo-pc/internal/bindings/index.js';
@@ -168,4 +169,51 @@ export function qualityLabels(qualities: StreamInfo[]): string[] {
     if (label && !labels.includes(label)) labels.push(label);
   }
   return labels;
+}
+
+/* ---------- mpv 内核（v0.1.12：local 源默认走 mpv，<video> 为 fallback） ---------- */
+
+/** 本机 mpv 是否可用（exe 旁有 libmpv-2.dll）。 */
+export function mpvAvailable(): Promise<boolean> {
+  return cast<Promise<boolean>>(MPVBinding.Available());
+}
+
+/** mpv 打开 url 播放；rect 为播放画面屏幕矩形 [x,y,w,h]（物理像素）。 */
+export function mpvPlay(url: string, title: string, rect: number[]): Promise<void> {
+  return cast<Promise<void>>(MPVBinding.Play(url, title, rect));
+}
+
+/** 挪渲染窗（主窗口移动/缩放跟随）。 */
+export function mpvMove(rect: number[]): Promise<void> {
+  return cast<Promise<void>>(MPVBinding.Move(rect));
+}
+
+/** 隐藏渲染窗（防黑窗残留）。 */
+export function mpvHide(): Promise<void> {
+  return cast<Promise<void>>(MPVBinding.Hide());
+}
+
+export function mpvTogglePause(): Promise<void> {
+  return cast<Promise<void>>(MPVBinding.TogglePause());
+}
+
+export function mpvSeekTo(sec: number): Promise<void> {
+  return cast<Promise<void>>(MPVBinding.SeekTo(sec));
+}
+
+export function mpvSetRate(rate: number): Promise<void> {
+  return cast<Promise<void>>(MPVBinding.SetRate(rate));
+}
+
+export function mpvSetVolume(v: number): Promise<void> {
+  return cast<Promise<void>>(MPVBinding.SetVolume(v));
+}
+
+/** 停止播放并关闭 mpv 窗口（换集/离开播放页）。 */
+export function mpvStop(): Promise<void> {
+  return cast<Promise<void>>(MPVBinding.Stop());
+}
+
+export function mpvPosition(): Promise<{ position: number; duration: number }> {
+  return cast<Promise<{ position: number; duration: number }>>(MPVBinding.Position());
 }

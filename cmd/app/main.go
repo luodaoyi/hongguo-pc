@@ -29,6 +29,7 @@ import (
 	"github.com/luodaoyi/hongguo-pc/internal/library"
 	"github.com/luodaoyi/hongguo-pc/internal/localsrv"
 	"github.com/luodaoyi/hongguo-pc/internal/media"
+	"github.com/luodaoyi/hongguo-pc/internal/mpvplayer"
 	"github.com/luodaoyi/hongguo-pc/internal/player"
 	"github.com/luodaoyi/hongguo-pc/internal/singleinstance"
 	"github.com/luodaoyi/hongguo-pc/internal/store"
@@ -233,8 +234,35 @@ func run() error {
 			application.NewServiceWithOptions(&bindings.Settings{Core: core}, serviceOptions),
 			application.NewServiceWithOptions(&bindings.Media{Core: core}, serviceOptions),
 			application.NewServiceWithOptions(&bindings.Diag{Core: core}, serviceOptions),
+			application.NewServiceWithOptions(&bindings.MPV{Core: core}, serviceOptions),
 		},
 	})
+
+	// 12. mpv 内核（v0.1.12 起 local 源默认走 mpv，<video> 为 fallback）：
+	// Chromium 对渐进 fMP4 音频包 fail-fast（PIPELINE_ERROR_DECODE），单个坏包
+	// 炸整条管线、连播误跳集；mpv 遇坏包跳过。EndFile 转前端事件决定连播。
+	// SetCallbacks 与 defer Close 在此注册；主窗口句柄注入在窗口创建后（见下）。
+	if mpvplayer.Available() {
+		logf("mpv 内核可用（libmpv）：local 源将走 mpv 播放")
+		mpvplayer.Get().SetCallbacks(
+			// eof=自然播完→转 player:mpv 事件由前端跳集；quit=用户关窗；error=解码失败。
+			func(reason string) {
+				bindings.Emit("player:mpv", map[string]any{"event": "ended", "reason": reason})
+			},
+			func(pos, dur float64) {
+				bindings.Emit("player:mpv", map[string]any{"event": "tick", "position": pos, "duration": dur})
+			},
+			func() {
+				bindings.Emit("player:mpv", map[string]any{"event": "play"})
+			},
+			func() {
+				bindings.Emit("player:mpv", map[string]any{"event": "pause"})
+			},
+		)
+		defer mpvplayer.Get().Close()
+	} else {
+		logf("mpv 不可用（exe 旁无 libmpv-2.dll）：继续用内置 <video> 播放")
+	}
 
 	// 11. 主窗口：1280×720，最小 960×540（方案 §8.5）。
 	mainWindow := app.Window.NewWithOptions(application.WebviewWindowOptions{
@@ -246,6 +274,22 @@ func run() error {
 		MinHeight:        540,
 		BackgroundColour: application.NewRGB(18, 18, 18),
 	})
+
+	// mpv 渲染窗的 owner：窗口在 Run 内才真正创建，轮询拿原生句柄注入
+	// bindings。拿不到就保持 0——MPV.Available 为 false，前端回退 <video>。
+	if mpvplayer.Available() {
+		go func() {
+			for i := 0; i < 200; i++ {
+				if hw := mainWindow.NativeWindow(); hw != nil {
+					bindings.MainWindowHandle = uintptr(hw)
+					logf("mpv 渲染窗 owner 已注入（主窗口句柄就绪）")
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			logf("mpv 主窗口句柄注入超时：本次运行 mpv 不可用（回退 <video>）")
+		}()
+	}
 
 	// 12. 退出：落盘断点 → 关媒体会话（杀 ffmpeg、删会话目录）→ 关本地服务 → 关库。
 	//

@@ -5,6 +5,7 @@ import * as Devices from "./devices.js";
 import * as Diag from "./diag.js";
 import * as History from "./history.js";
 import * as Library from "./library.js";
+import * as MPV from "./mpv.js";
 import * as Media from "./media.js";
 import * as Player from "./player.js";
 import * as Settings from "./settings.js";
@@ -13,6 +14,7 @@ export {
     Diag,
     History,
     Library,
+    MPV,
     Media,
     Player,
     Settings

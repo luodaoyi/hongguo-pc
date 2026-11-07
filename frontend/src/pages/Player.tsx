@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as api from '../api';
 import {
   onEvent,
+  type MpvEventPayload,
   type PlayerProgressPayload,
   type PreparingPayload,
   type QuotaChangedPayload,
@@ -65,6 +66,15 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   // 且 Chromium 锁定后不再更新，管不了——去掉 controls，自己画。
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  // mpv 内核路径（v0.1.12）：local/direct 源交给 libmpv 独立窗口播放，
+  // Chromium <video> 对渐进 fMP4 音频包 fail-fast（坏包炸整条管线、连播
+  // 误跳集），退为 mpv 不可用时的 fallback。null=尚未探测。
+  const [mpvMode, setMpvMode] = useState<boolean | null>(null);
+  // 最近一次 tick 的位置/时长：ended(eof) 时判断是否 premature（渐进文件
+  // 还在写、mpv 提前读到尾）。sourceRef 供续播重载取当前地址。
+  const lastTickRef = useRef<{ pos: number; dur: number }>({ pos: 0, dur: 0 });
+  const sourceRef = useRef<Source | null>(null);
+  sourceRef.current = source;
   // 自动下一集：唯一真值在 Go 设置项 autoNextEpisode（Settings.Get/Set），
   // localStorage 那份已删除（首辅裁断：两个开关必须合成一个）。
   const [autoNext, setAutoNext] = useState(true);
@@ -204,6 +214,10 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   }, [episodes, episodeId, switchTo]);
 
   const togglePlay = useCallback(() => {
+    if (mpvMode) {
+      void api.mpvTogglePause().catch(() => {});
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
@@ -216,7 +230,7 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
     } else {
       video.pause();
     }
-  }, []);
+  }, [mpvMode]);
 
   /** 展示/seek 共用的有效时长：元数据与后端可信时长取大（moov 估计值偏小）。 */
   const effectiveDuration = Math.max(videoDuration, trustedDuration);
@@ -224,6 +238,13 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   /** 点进度条跳转到指定秒；上限即有效时长。 */
   const seekTo = useCallback(
     (seconds: number) => {
+      if (mpvMode) {
+        if (!Number.isFinite(seconds) || seconds < 0) return;
+        void api.mpvSeekTo(seconds).catch(() => {});
+        setCurrentTime(seconds);
+        reportPosition(true);
+        return;
+      }
       const video = videoRef.current;
       if (!video || !Number.isFinite(seconds) || seconds < 0) return;
       const duration = Math.max(
@@ -234,7 +255,7 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
       video.currentTime = Math.min(seconds, duration);
       reportPosition(true);
     },
-    [reportPosition, trustedDuration],
+    [mpvMode, reportPosition, trustedDuration],
   );
 
   const toggleMute = useCallback(() => {
@@ -244,6 +265,11 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
 
   const seekBy = useCallback(
     (delta: number) => {
+      if (mpvMode) {
+        void api.mpvSeekTo(Math.max(0, currentTime + delta)).catch(() => {});
+        reportPosition(true);
+        return;
+      }
       const video = videoRef.current;
       if (!video) return;
       // 渐进 fMP4 初始 moov 时长偏小：seek 上限取「元数据与后端可信时长」的较大者。
@@ -252,7 +278,7 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
       video.currentTime = Math.min(Math.max(0, video.currentTime + delta), duration);
       reportPosition(true);
     },
-    [reportPosition, trustedDuration],
+    [mpvMode, currentTime, reportPosition, trustedDuration],
   );
 
   const toggleFullscreen = useCallback(() => {
@@ -317,6 +343,28 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   useEffect(() => {
     goNextRef.current = goNext;
   }, [goNext]);
+
+  // handleEnded 经 ref 供 mpv 事件回调使用（定义在后，避免依赖序问题）。
+  const handleEndedRef = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    handleEndedRef.current = handleEnded;
+  }, []);
+
+  // 挂载时探测一次 mpv 可用性（dll 探测很快，且进程内不会变）。
+  useEffect(() => {
+    let alive = true;
+    void api
+      .mpvAvailable()
+      .then((ok) => {
+        if (alive) setMpvMode(ok);
+      })
+      .catch(() => {
+        if (alive) setMpvMode(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     pendingSeekRef.current = startAt > 0 ? startAt : 0;
@@ -386,6 +434,148 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
 
   // 卸载时强制落一次进度（任务书：暂停/切集/卸载强制上报）
   useEffect(() => () => reportPosition(true), [reportPosition]);
+
+  /* ---------- mpv 内核路径 ---------- */
+
+  // 播放画面的视口矩形（物理像素）：渲染窗要对齐的 .player-stage 区域，
+  // 排除顶部栏与选集抽屉。屏幕坐标由 Go 侧 ClientToScreen 换算（自动吸收
+  // 标题栏高度——window.screenX 是外框原点，直接加会偏移一个标题栏）。
+  const stageScreenRect = (): number[] => {
+    const el = stageRef.current;
+    if (!el) return [];
+    const r = el.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    return [r.left * dpr, r.top * dpr, r.width * dpr, r.height * dpr];
+  };
+
+  // 离开播放页/换集时停掉 mpv 并隐藏渲染窗（<video> 随组件走，mpv 是
+  // 进程级的必须显式停；只停不隐藏会留黑窗盖住别的页面）。
+  useEffect(() => {
+    if (!mpvMode) return undefined;
+    return () => {
+      void api.mpvStop().catch(() => {});
+      void api.mpvHide().catch(() => {});
+    };
+  }, [mpvMode]);
+
+  // source 就绪 + mpv 可用：交给 mpv 播放（续播点经 seek 恢复，倍速同理）。
+  // 回退纪律：只有 Play 本身失败（mpv 拒播/加载超时）才回退 <video>；
+  // seek/倍速失败只警告——mpv 已在播，不能再中 Chromium 的坏包管线（首版
+  // 误把「加载未完成时 seek 失败」当 mpv 不可用，正是双窗口+报错的根因）。
+  useEffect(() => {
+    if (mpvMode !== true || !source?.url || phase !== 'ready') return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        await api.mpvPlay(source.url, series?.title ?? '红果短剧', stageScreenRect());
+        if (cancelled) return;
+        // Play 内部才建渲染窗，先于 Play 的首 Move 可能落在建窗前（Go 侧
+        // pendingRect 已兜底，这里再强制补一次，双保险）。
+        void api.mpvMove(stageScreenRect()).catch(() => {});
+      } catch (err) {
+        if (!cancelled) {
+          console.warn('[player] mpv 起播失败，回退 <video>：', errorMessage(err));
+          void api.mpvHide().catch(() => {});
+          setMpvMode(false);
+        }
+        return;
+      }
+      const target = pendingSeekRef.current;
+      if (target > 0) {
+        try {
+          await api.mpvSeekTo(target);
+        } catch (err) {
+          console.warn('[player] mpv 续播 seek 失败（忽略，从头播）：', errorMessage(err));
+        }
+        pendingSeekRef.current = 0;
+      }
+      if (playbackRateRef.current !== 1) {
+        try {
+          await api.mpvSetRate(playbackRateRef.current);
+        } catch (err) {
+          console.warn('[player] mpv 恢复倍速失败（忽略）：', errorMessage(err));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [mpvMode, source?.url, phase, series?.title]);
+
+  // 渲染窗几何跟随：主窗口移动（screenX/Y 变化，无 DOM 事件）+ 缩放
+  // （resize/抽屉开合）。500ms 轮询矩形变化，变了才调 Move（幂等）。
+  useEffect(() => {
+    if (mpvMode !== true) return undefined;
+    let last = '';
+    const sync = () => {
+      const rect = stageScreenRect();
+      if (rect.length !== 4) return;
+      const key = rect.map((n) => Math.round(n)).join(',');
+      if (key === last) return;
+      last = key;
+      void api.mpvMove(rect).catch(() => {});
+    };
+    sync();
+    const timer = window.setInterval(sync, 500);
+    const ro = new ResizeObserver(sync);
+    if (stageRef.current) ro.observe(stageRef.current);
+    window.addEventListener('resize', sync);
+    return () => {
+      window.clearInterval(timer);
+      ro.disconnect();
+      window.removeEventListener('resize', sync);
+    };
+  }, [mpvMode]);
+
+  // mpv 事件驱动：tick 更新进度/时长，play/pause 更新按钮，ended 按 reason 分流
+  // （eof 才连播——这就是修「播一半跳下一集」的关键：解码失败不再伪装成播完）。
+  useEffect(() => {
+    if (mpvMode !== true) return undefined;
+    return onEvent('player:mpv', (payload: MpvEventPayload) => {
+      if (payload.event === 'tick') {
+        setCurrentTime(payload.position ?? 0);
+        const dur = payload.duration ?? 0;
+        if (dur > 0) setVideoDuration((prev) => Math.max(prev, dur, trustedDuration));
+        lastTickRef.current = { pos: payload.position ?? 0, dur };
+      } else if (payload.event === 'play') {
+        setPlaying(true);
+      } else if (payload.event === 'pause') {
+        setPlaying(false);
+      } else if (payload.event === 'ended') {
+        if (payload.reason === 'eof') {
+          // 渐进文件竞态：转码还在写、mpv 已读到当前文件尾——此刻的「eof」
+          // 是 premature，绝不能跳集。对照后端可信时长：位置差得远就重载续播
+          // （此时写入多半已完成），真正播完（位置贴近时长）才走连播。
+          const last = lastTickRef.current;
+          const trusted = trustedDuration;
+          const pos = last?.pos ?? 0;
+          const shown = Math.max(last?.dur ?? 0, trusted);
+          if (shown > 5 && pos < shown - 4 && sourceRef.current?.url) {
+            setNotice('视频仍在后台写入，已自动续播');
+            const url = sourceRef.current.url;
+            void (async () => {
+              try {
+                await api.mpvPlay(url, '', []);
+                await api.mpvSeekTo(Math.max(0, pos - 1));
+              } catch (err) {
+                console.warn('[player] 续播失败：', errorMessage(err));
+              }
+            })();
+            return;
+          }
+          handleEndedRef.current();
+        } else if (payload.reason === 'error') {
+          setError({
+            code: 'media_error',
+            message: 'mpv 解码失败（已尽量容错；可重试或回退内置内核）',
+            retryable: true,
+            episodeId: episodeIdRef.current,
+          });
+        }
+        // quit（用户关窗/Stop）：不跳集、不报错，静默回到页面。
+      }
+    });
+  }, [mpvMode, trustedDuration]);
 
   /* ---------- 事件 ---------- */
 
@@ -562,6 +752,10 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
               const rate = Number(event.target.value);
               setPlaybackRate(rate);
               playbackRateRef.current = rate;
+              if (mpvMode) {
+                void api.mpvSetRate(rate).catch(() => {});
+                return;
+              }
               const video = videoRef.current;
               if (video) video.playbackRate = rate;
             }}
@@ -615,6 +809,9 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
 
       <div className="player-body">
         <div className="player-stage" ref={stageRef}>
+          {/* mpv 模式：画面在 mpv 独立窗口（WebView 之下塞 HWND 会被盖住），
+              页内只保留控制条与选集；<video> 卸载避免 Chromium 再碰坏包。 */}
+          {mpvMode !== true ? (
           <video
             ref={videoRef}
             className="player-video"
@@ -665,6 +862,11 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
               setVideoDuration((prev) => Math.max(prev, meta, trustedDuration));
             }}
           />
+          ) : (
+            <div className="player-overlay" style={{ pointerEvents: 'auto' }}>
+              正在 mpv 播放窗口中播放（本窗口仅显示控制与选集）
+            </div>
+          )}
           {phase === 'resolving' ? <div className="player-overlay">正在解析播放地址…</div> : null}
           {videoDuration > 0 && phase === 'ready' ? (
             <div className="player-duration-badge">时长 {formatDuration(videoDuration)}</div>

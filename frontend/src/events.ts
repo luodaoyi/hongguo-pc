@@ -14,11 +14,22 @@ export type EventName =
   | 'player:state'
   | 'player:error'
   | 'player:progress'
+  | 'player:mpv'
   | 'episode:updated'
   | 'quota:changed'
   | 'quota:exhausted'
   | 'media:preparing'
   | 'devices:changed';
+
+/** mpv 内核事件（internal/mpvplayer 回调经 Go Emit 转发）。 */
+export interface MpvEventPayload {
+  event: 'ended' | 'tick' | 'play' | 'pause';
+  /** 仅 ended：eof=自然播完、quit=用户关窗/停止、error=解码失败。 */
+  reason?: string;
+  /** 仅 tick。 */
+  position?: number;
+  duration?: number;
+}
 
 export interface PlayerStatePayload {
   state: string;
@@ -64,6 +75,7 @@ export interface EventPayloads {
   'player:state': PlayerStatePayload;
   'player:error': PlayerErrorPayload;
   'player:progress': PlayerProgressPayload;
+  'player:mpv': MpvEventPayload;
   'episode:updated': EpisodeUpdatedPayload;
   'quota:changed': QuotaChangedPayload;
   'quota:exhausted': Record<string, never>;
@@ -77,6 +89,7 @@ const KNOWN_EVENTS: EventName[] = [
   'player:state',
   'player:error',
   'player:progress',
+  'player:mpv',
   'episode:updated',
   'quota:changed',
   'quota:exhausted',

@@ -28,3 +28,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 hg-detail-*.png
+
+# mpv 本地验证产物（libmpv-2.dll 121MB 不入库，CI 发版时下载分发）
+bin/
+libmpv-2.dll
