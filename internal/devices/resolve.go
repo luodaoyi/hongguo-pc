@@ -51,6 +51,7 @@ func (p *Pool) ResolvePlayback(ctx context.Context, episodeID string) (*sdkmodel
 		return pb, nil
 	}
 
+	keyRetries := 0 // 密钥材料解不开时的换设备重试计数（每集最多一次）
 	for attempt := 1; ; attempt++ {
 		// Unlimited 模式：尝试次数不设上限，烧一台造一台，直到成功或 ctx 取消；
 		// 上限只约束单次解析内对存量槽的重试（防对冷却中的池空转）。
@@ -101,8 +102,14 @@ func (p *Pool) ResolvePlayback(ctx context.Context, episodeID string) (*sdkmodel
 		case isKeyUnavailable(callErr):
 			// 模型拿到了、密钥解不开。这台设备的额度已经真实消耗掉（服务端只回一次
 			// 模型，方案 §4.1），必须记账，否则 UsedToday 会少算一台（T13 审查 D2）。
-			// 仍然不写缓存，仍把 KeyUnavailableError 交给上层按 §6.3 跳过。
+			// 换一台设备重试一次：不同设备的签名/参数可能让服务端下发不同形态的
+			// 密钥材料（v0.1.14 实测某集 spade 材料解析失败）；仍失败才交上层跳过。
 			p.MarkExhausted(s)
+			if keyRetries < 1 {
+				keyRetries++
+				p.logf("devices: key unavailable for %s on %s; retrying on a fresh device", episodeID, s.ID)
+				continue
+			}
 			return pb, callErr
 
 		case callErr == nil, errors.Is(callErr, sdkx.ErrDRMProtected) && pb != nil:

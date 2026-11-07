@@ -134,7 +134,7 @@ func Describe(err error) Failure {
 	}
 	var ku *sdkx.KeyUnavailableError
 	if errors.As(err, &ku) {
-		return Failure{Code: CodeKeyUnsupported, Message: "该集加密方式暂不支持，已跳过", Retryable: false}
+		return Failure{Code: CodeKeyUnsupported, Message: "该集加密方式暂不支持（已尝试换设备解析），可跳过此集或稍后再试", Retryable: false}
 	}
 	code, msg, retryable := sdkx.Classify(err)
 	return Failure{Code: code, Message: msg, Retryable: retryable}

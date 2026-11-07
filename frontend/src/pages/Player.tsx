@@ -465,9 +465,18 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   const stageScreenRect = (): number[] => {
     const el = stageRef.current;
     if (!el) return [];
+    // 渲染窗只盖画面区：底部控制条是 WebView 画的 DOM，被子窗口挡住就
+    // 彻底不可见（WS_DISABLED 只穿透点击、不穿透显示）——高度扣掉它。
+    const controls = el.querySelector('.player-controls');
+    const controlsH = controls ? controls.getBoundingClientRect().height : 0;
     const r = el.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    return [r.left * dpr, r.top * dpr, r.width * dpr, r.height * dpr];
+    return [
+      r.left * dpr,
+      r.top * dpr,
+      r.width * dpr,
+      Math.max(0, (r.height - controlsH) * dpr),
+    ];
   };
 
   // 离开播放页/换集时停掉 mpv 并隐藏渲染窗（<video> 随组件走，mpv 是
@@ -818,6 +827,15 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
           <button className="button" type="button" onClick={retry} disabled={quotaExhausted}>
             重试
           </button>
+          {/* 加密方式不支持/内容不可用这类集级错误：重试通常无用，给一键跳过
+              （连播会自动跳，手动点集失败时之前只能干看）。 */}
+          {error.code === 'drm_unsupported' ||
+          error.code === 'content_unavailable' ||
+          error.code === 'anonymous_limited' ? (
+            <button className="button" type="button" onClick={() => goNextRef.current('keyboard')}>
+              跳过此集
+            </button>
+          ) : null}
         </div>
       ) : null}
 
