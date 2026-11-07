@@ -85,13 +85,16 @@ func TestUnlimitedGrowWhenAllExhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 全部槽置为 exhausted 且带真实 lastUsed（复现「看剧一天后全烧完」的状态）。
+	// quotaDay 必须取当天：写死日期后隔天跑，dayKey 已翻页、额度自动重置，
+	// growSlot 不会再扩槽（2026-11-07 实测踩坑）。
 	p.mu.Lock()
 	now := p.now()
+	today := now.Year()*10000 + int(now.Month())*100 + now.Day()
 	for _, s := range p.slots {
 		s.state = "exhausted"
 		s.lastUsed = now.Add(-time.Hour)
 		s.quotaUsed = 1
-		s.quotaDay = 20261106
+		s.quotaDay = today
 	}
 	p.mu.Unlock()
 	s, err := p.Acquire(context.Background())
