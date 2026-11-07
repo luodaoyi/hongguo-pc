@@ -27,21 +27,6 @@ var syscallN = purego.SyscallN
 
 func float64Bits(f float64) uint64 { return math.Float64bits(f) }
 
-// mpv_format 常量（mpv/client.h）。
-const (
-	FormatFlag   = 3
-	FormatDouble = 5
-	FormatString = 6
-
-	eventNone = 0
-	eventEnd  = 7
-
-	endFileEOF   = 0
-	endFileStop  = 2
-	endFileQuit  = 3
-	endFileError = 4
-)
-
 var (
 	libMu     sync.Mutex
 	libLoaded bool
@@ -108,12 +93,6 @@ type cMpvEvent struct {
 	Error    int32
 	Userdata uint64
 	Data     uintptr
-}
-
-// mpvEvent 是绑定层的事件（EndReason 仅 EventEnd 时有效）。
-type mpvEvent struct {
-	ID        int32
-	EndReason int32
 }
 
 // cStr 分配 UTF-8 C 字符串（含结尾 0），返回指针。
@@ -267,16 +246,4 @@ func (c *nativeClient) Initialize() error {
 		return fmt.Errorf("mpv_initialize: %d", int32(r))
 	}
 	return nil
-}
-
-// classifyEndReason 把 mpv EndFile reason 映射为应用层语义。
-func classifyEndReason(reason int32) string {
-	switch reason {
-	case endFileEOF:
-		return "eof"
-	case endFileStop, endFileQuit:
-		return "quit"
-	default:
-		return "error"
-	}
 }

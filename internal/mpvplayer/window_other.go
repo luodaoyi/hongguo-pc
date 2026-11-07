@@ -19,3 +19,9 @@ func (p *Player) HideRenderWindow() {}
 
 // closeRenderWindow 非 Windows 无操作。
 func (p *Player) closeRenderWindow() {}
+
+// applyPending 非 Windows 无操作。
+func (p *Player) applyPending() {}
+
+// hideRenderWindowLocked 非 Windows 无操作（Stop 内持锁调用）。
+func (p *Player) hideRenderWindowLocked() {}

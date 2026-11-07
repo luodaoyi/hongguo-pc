@@ -91,7 +91,7 @@ func (p *Player) AttachOwner(ownerPtr uintptr) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	p.renderHwnd = hwnd
+	p.renderHwnd = uintptr(hwnd)
 	return int64(hwnd), nil
 }
 

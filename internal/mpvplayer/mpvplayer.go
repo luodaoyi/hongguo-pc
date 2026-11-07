@@ -19,8 +19,6 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"golang.org/x/sys/windows"
 )
 
 // callbacks 是上层（bindings/Player）注册的事件出口；mpv 事件线程回调里
@@ -40,7 +38,7 @@ type Player struct {
 	owner      bool // dll 是否加载成功（Available 的内核依据）
 	cb         callbacks
 	ticker     *time.Ticker
-	renderHwnd windows.HWND // Windows 渲染窗（wid），Close 时销毁
+	renderHwnd uintptr  // Windows 渲染窗句柄（wid），Close 时销毁
 	lastURL    string
 
 	// 渲染窗几何：子窗口坐标相对父客户区（= 前端视口相对物理像素），
