@@ -1,4 +1,4 @@
-// Package mpvplayer 用 libmpv（经 go-mpv 的 purego 绑定，无 CGO）替代
+// Package mpvplayer 用 libmpv（自写 purego 最小绑定，无 CGO、惰性加载）替代
 // WebView2 的 <video> 内核播放本地媒体。
 //
 // 为什么换内核：Chromium 的 MP4 demuxer 对渐进 fMP4 的音频包容错是
@@ -7,8 +7,8 @@
 // mpv 的 demuxer 遇坏包跳过继续播，且 demuxer-max-bytes-bytes 可配大缓冲，
 // 渐进分片边写边播的等待行为也更可控。
 //
-// 窗口模型：mpv 以 --force-window 独立成窗（父进程窗口归属主程序），
-// 不嵌入 WebView 之下（Wails v3 的 WebView 覆盖整窗，塞 HWND 会被盖住）。
+// 窗口模型：mpv wid 指向主窗口的 WS_CHILD 子窗口——父动子随、点击穿透
+// 到 WebView（owned 顶层窗方案实测拖动不跟、挡死控制条，已弃）。
 // 播放/暂停/进度/音量经 mpv 属性读写；EndFile 事件回调上层决定连播。
 //
 // dll 缺失（libmpv-2.dll 不在 exe 旁）时 Available() 为 false，前端回退
@@ -17,29 +17,26 @@ package mpvplayer
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/gen2brain/go-mpv"
 	"golang.org/x/sys/windows"
 )
 
 // callbacks 是上层（bindings/Player）注册的事件出口；mpv 事件线程回调里
 // 只做非阻塞投递，业务逻辑（连播解析、进度落盘）由既有 Go 侧处理。
 type callbacks struct {
-	onEnded   func(reason string) // eof | error | quit
-	onTick    func(positionSec, durationSec float64)
-	onPlay    func()
-	onPause   func()
+	onEnded func(reason string) // eof | error | quit
+	onTick  func(positionSec, durationSec float64)
+	onPlay  func()
+	onPause func()
 }
 
 // Player 是单例 mpv 实例：一个应用同时只播一个视频，复用实例省去
 // 反复初始化的开销（mpv Initialize 约几十毫秒）。
 type Player struct {
 	mu         sync.Mutex
-	mpv        *mpv.Mpv
+	mpv        *nativeClient
 	owner      bool // dll 是否加载成功（Available 的内核依据）
 	cb         callbacks
 	ticker     *time.Ticker
@@ -67,24 +64,8 @@ func Get() *Player {
 	return single
 }
 
-// probe 探测 exe 旁是否有可加载的 libmpv；不初始化实例。
-func probe() bool {
-	names := []string{"libmpv-2.dll", "libmpv.dll", "mpv-2.dll", "mpv-1.dll"}
-	for _, n := range names {
-		if _, err := os.Stat(filepath.Join(exeDir(), n)); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-func exeDir() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return "."
-	}
-	return filepath.Dir(exe)
-}
+// probe 真实加载 libmpv（结果缓存于 native 包内），非文件存在性猜测。
+func probe() bool { return nativeAvailable() }
 
 // Available 报告本机能否走 mpv 路径（dll 是否就位）。
 func Available() bool { return Get().owner }
@@ -145,7 +126,7 @@ func (p *Player) Play(url, title string, ownerPtr uintptr) error {
 		if m == nil {
 			return fmt.Errorf("mpv 已关闭")
 		}
-		if v, err := m.GetProperty("filename", mpv.FormatString); err == nil && v.(string) != "" {
+		if v, err := m.GetProperty("filename", FormatString); err == nil && v.(string) != "" {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -157,7 +138,10 @@ func (p *Player) Play(url, title string, ownerPtr uintptr) error {
 // wid 非空时在 Initialize 前设置（initialization-only），渲染进宿主窗口；
 // wid 为空时 force-window 自建窗口（独立窗口模式）。
 func (p *Player) initInstance(wid string) error {
-	m := mpv.New()
+	m, err := newNativeClient()
+	if err != nil {
+		return err
+	}
 	// 事件必开：EndFile/时间更新走事件线程，不开收不到。
 	if err := m.SetOptionString("terminal", "no"); err != nil {
 		return fmt.Errorf("mpv option terminal: %w", err)
@@ -198,6 +182,7 @@ func (p *Player) startObserve() {
 		p.ticker.Stop()
 	}
 	p.ticker = time.NewTicker(500 * time.Millisecond)
+	lastPaused := false // 泵周期内的暂停态（变化沿才发事件）
 	go func(t *time.Ticker) {
 		for range t.C {
 			p.mu.Lock()
@@ -208,49 +193,48 @@ func (p *Player) startObserve() {
 				return
 			}
 			// 事件先排空：EndFile 在属性读取前处理，跳集判定不被延迟。
-			// 渐进文件特判：mpv 读到当前文件尾会当 EOF——但文件可能还在写。
-			// 用 duration 与 time-pos 贴近且 demuxer 缓存耗尽特征区分真播完。
 			for {
 				ev := m.WaitEvent(0)
-				if ev == nil || ev.EventID == mpv.EventNone {
+				if ev.ID == eventNone {
 					break
 				}
-				if ev.EventID == mpv.EventEnd {
-					reason := "error"
-					switch ev.EndFile().Reason {
-					case mpv.EndFileEOF:
-						reason = "eof"
-					case mpv.EndFileStop, mpv.EndFileQuit:
-						reason = "quit"
-					default:
-						reason = "error"
-					}
+				if ev.ID == eventEnd {
 					p.mu.Unlock()
 					if cb.onEnded != nil {
-						cb.onEnded(reason)
+						cb.onEnded(classifyEndReason(ev.EndReason))
 					}
 					return // EndFile 后本泵退役；下次 Play 重新起
 				}
 			}
 			pos, dur := 0.0, 0.0
-			if v, err := m.GetProperty("time-pos", mpv.FormatDouble); err == nil {
+			if v, err := m.GetProperty("time-pos", FormatDouble); err == nil {
 				pos, _ = v.(float64)
 			}
-			if v, err := m.GetProperty("duration", mpv.FormatDouble); err == nil {
+			if v, err := m.GetProperty("duration", FormatDouble); err == nil {
 				dur, _ = v.(float64)
 			}
 			paused := false
-			if v, err := m.GetProperty("pause", mpv.FormatFlag); err == nil {
+			if v, err := m.GetProperty("pause", FormatFlag); err == nil {
 				paused, _ = v.(bool)
 			}
 			p.mu.Unlock()
 			if cb.onTick != nil {
 				cb.onTick(pos, dur)
 			}
-			if cb.onPause != nil {
-				cb.onPause()
+			// 仅在暂停态变化时发 play/pause：无条件每 tick 发会把前端
+			// 播放按钮打回「未播放」（首版实测按钮状态闪烁）。
+			if paused != lastPaused {
+				lastPaused = paused
+				if paused {
+					if cb.onPause != nil {
+						cb.onPause()
+					}
+				} else {
+					if cb.onPlay != nil {
+						cb.onPlay()
+					}
+				}
 			}
-			_ = paused
 		}
 	}(p.ticker)
 }
@@ -316,10 +300,10 @@ func (p *Player) Position() (float64, float64) {
 		return 0, 0
 	}
 	pos, dur := 0.0, 0.0
-	if v, err := p.mpv.GetProperty("time-pos", mpv.FormatDouble); err == nil {
+	if v, err := p.mpv.GetProperty("time-pos", FormatDouble); err == nil {
 		pos, _ = v.(float64)
 	}
-	if v, err := p.mpv.GetProperty("duration", mpv.FormatDouble); err == nil {
+	if v, err := p.mpv.GetProperty("duration", FormatDouble); err == nil {
 		dur, _ = v.(float64)
 	}
 	return pos, dur

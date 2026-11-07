@@ -71,10 +71,16 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   // 误跳集），退为 mpv 不可用时的 fallback。null=尚未探测。
   const [mpvMode, setMpvMode] = useState<boolean | null>(null);
   // 最近一次 tick 的位置/时长：ended(eof) 时判断是否 premature（渐进文件
-  // 还在写、mpv 提前读到尾）。sourceRef 供续播重载取当前地址。
+  // 还在写、mpv 提前读到尾）。sourceRef 供续播重载取当前地址；
+  // currentTimeRef/mpvModeRef 供 reportPosition 等回调读即时值（state 闭包
+  // 会过期）。
   const lastTickRef = useRef<{ pos: number; dur: number }>({ pos: 0, dur: 0 });
   const sourceRef = useRef<Source | null>(null);
   sourceRef.current = source;
+  const currentTimeRef = useRef(0);
+  const mpvModeRef = useRef(false);
+  mpvModeRef.current = mpvMode === true;
+  const mutedRef = useRef(false);
   // 自动下一集：唯一真值在 Go 设置项 autoNextEpisode（Settings.Get/Set），
   // localStorage 那份已删除（首辅裁断：两个开关必须合成一个）。
   const [autoNext, setAutoNext] = useState(true);
@@ -113,10 +119,13 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
 
   /** 上报进度；force=false 时按 5 秒节流（任务书「timeupdate 5 秒节流」）。 */
   const reportPosition = useCallback((force: boolean) => {
-    const video = videoRef.current;
     const id = episodeIdRef.current;
-    if (!video || !id) return;
-    const position = video.currentTime;
+    if (!id) return;
+    // mpv 模式没有 <video>：位置来自 mpv tick 的 currentTimeRef（首版在这
+    // 里因 video 为 null 直接 return，播放进度永远不上报、续播失效）。
+    const position = mpvModeRef.current
+      ? currentTimeRef.current
+      : (videoRef.current?.currentTime ?? NaN);
     if (!Number.isFinite(position) || position < 0) return;
     const last = lastReportRef.current;
     if (!force && last.episodeId === id && position - last.position < 5) return;
@@ -259,9 +268,22 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
   );
 
   const toggleMute = useCallback(() => {
+    if (mpvMode) {
+      // mpv 模式：mute 属性翻转（音量不走 video 元素）。
+      void (async () => {
+        try {
+          const wasMuted = mutedRef.current;
+          await api.mpvSetVolume(wasMuted ? 100 : 0);
+          mutedRef.current = !wasMuted;
+        } catch (err) {
+          console.warn('[player] mpv 静音切换失败：', errorMessage(err));
+        }
+      })();
+      return;
+    }
     const video = videoRef.current;
     if (video) video.muted = !video.muted;
-  }, []);
+  }, [mpvMode]);
 
   const seekBy = useCallback(
     (delta: number) => {
@@ -534,6 +556,7 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
     return onEvent('player:mpv', (payload: MpvEventPayload) => {
       if (payload.event === 'tick') {
         setCurrentTime(payload.position ?? 0);
+        currentTimeRef.current = payload.position ?? 0;
         const dur = payload.duration ?? 0;
         if (dur > 0) setVideoDuration((prev) => Math.max(prev, dur, trustedDuration));
         lastTickRef.current = { pos: payload.position ?? 0, dur };
@@ -862,11 +885,7 @@ export function PlayerPage({ seriesId, episodeId, startAt }: PlayerPageProps) {
               setVideoDuration((prev) => Math.max(prev, meta, trustedDuration));
             }}
           />
-          ) : (
-            <div className="player-overlay" style={{ pointerEvents: 'auto' }}>
-              正在 mpv 播放窗口中播放（本窗口仅显示控制与选集）
-            </div>
-          )}
+          ) : null}
           {phase === 'resolving' ? <div className="player-overlay">正在解析播放地址…</div> : null}
           {videoDuration > 0 && phase === 'ready' ? (
             <div className="player-duration-badge">时长 {formatDuration(videoDuration)}</div>

@@ -27,16 +27,16 @@ import (
 )
 
 const (
-	wsChild       = 0x40000000
+	wsChild        = 0x40000000
 	wsClipsiblings = 0x04000000
-	wsDisabled    = 0x08000000
-	swpShowWindow = 0x0040
-	swpHideWindow = 0x0080
-	swpNoActivate = 0x0010
+	wsDisabled     = 0x08000000
+	swpShowWindow  = 0x0040
+	swpHideWindow  = 0x0080
+	swpNoActivate  = 0x0010
 )
 
 var (
-	user32 = windows.NewLazySystemDLL("user32.dll")
+	user32              = windows.NewLazySystemDLL("user32.dll")
 	procCreateWindowExW = user32.NewProc("CreateWindowExW")
 	procDestroyWindow   = user32.NewProc("DestroyWindow")
 	procSetWindowPos    = user32.NewProc("SetWindowPos")
